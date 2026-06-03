@@ -130,11 +130,6 @@ pub struct ProtocolState {
     pub stats: ParserStats,
     /// Log the first stream_event unwrap only (avoid log spam).
     seen_stream_event_envelope: bool,
-    /// Context occupancy of the most recent MAIN-chain assistant request this turn:
-    /// input + cache_read + cache_creation tokens. Emitted on `result` as
-    /// `UsageUpdate.context_tokens` and reset, so the context gauge reflects the last
-    /// request rather than the cumulative (over-counted) turn total. (#149)
-    last_request_context: Option<u64>,
     /// When true, map_event panics on unknown/invalid events instead of degrading gracefully.
     /// Only available in test builds — production always degrades.
     #[cfg(test)]
@@ -181,7 +176,6 @@ impl ProtocolState {
             pending_slash_command: None,
             stats: ParserStats::default(),
             seen_stream_event_envelope: false,
-            last_request_context: None,
             #[cfg(test)]
             strict_mode: false,
         }
@@ -764,22 +758,6 @@ impl ProtocolState {
                     .map(String::from);
                 let msg_usage = message.get("usage").cloned();
 
-                // Track this request's context occupancy (input + cache_read + cache_creation)
-                // for the context gauge. Only MAIN-chain requests (no parent_tool_use_id) count —
-                // sub-agent/sidechain requests must not move the main conversation's gauge. The
-                // last such value before `result` is emitted as UsageUpdate.context_tokens. (#149)
-                if parent_tool_use_id.is_none() {
-                    if let Some(u) = msg_usage.as_ref() {
-                        let get = |k: &str| u.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
-                        let ctx = get("input_tokens")
-                            + get("cache_read_input_tokens")
-                            + get("cache_creation_input_tokens");
-                        if ctx > 0 {
-                            self.last_request_context = Some(ctx);
-                        }
-                    }
-                }
-
                 if msg_model.is_some() {
                     log::debug!(
                         "[protocol] assistant message: model={:?}, stop_reason={:?}",
@@ -1058,17 +1036,14 @@ impl ProtocolState {
                                     .collect::<HashMap<_, _>>()
                             });
 
-                    // Cost per model: trust the CLI's own costUSD for native Claude/OpenAI
-                    // models (the CLI knows its exact pricing — tiers, batch, etc. — better
-                    // than our static table). Only third-party providers (DeepSeek, MiniMax,
-                    // GLM, …) get Claude-based pricing wrong, so we recalculate those from
-                    // our table. (#149 / upstream #151)
+                    // Cost source (#149): trust the CLI's reported cost for native Claude/OpenAI
+                    // — it knows its own pricing (incl. $0 for subscription/Max plans) and stays
+                    // correct across model releases without app updates. Only recalculate when a
+                    // third-party provider is present, since the CLI mis-prices those as Claude.
                     let (cost, model_usage) = if let Some(mut mu) = model_usage {
-                        let mut total = 0.0_f64;
-                        for (model_name, entry) in mu.iter_mut() {
-                            if crate::pricing::is_native_pricing_model(model_name) {
-                                total += entry.cost_usd; // CLI value (from costUSD)
-                            } else {
+                        if mu.keys().any(|m| crate::pricing::is_third_party(m)) {
+                            let mut total = 0.0_f64;
+                            for (model_name, entry) in mu.iter_mut() {
                                 let recalculated = crate::pricing::estimate_cost(
                                     model_name,
                                     entry.input_tokens,
@@ -1079,8 +1054,11 @@ impl ProtocolState {
                                 entry.cost_usd = recalculated;
                                 total += recalculated;
                             }
+                            (total, Some(mu))
+                        } else {
+                            // Native only — keep the CLI's total_cost_usd and per-model costUSD.
+                            (cost, Some(mu))
                         }
-                        (total, Some(mu))
                     } else {
                         (cost, None)
                     };
@@ -1126,11 +1104,6 @@ impl ProtocolState {
                         );
                     }
 
-                    // Last main-chain request's context occupancy (reset per turn). The
-                    // cumulative token fields above over-count context on multi-request
-                    // turns; this reflects the final request only. (#149)
-                    let context_tokens = self.last_request_context.take();
-
                     events.push(BusEvent::UsageUpdate {
                         run_id: run_id.to_string(),
                         input_tokens,
@@ -1149,7 +1122,6 @@ impl ProtocolState {
                         web_fetch_requests,
                         cache_creation_5m,
                         cache_creation_1h,
-                        context_tokens,
                     });
 
                     // Hint: if CLI didn't emit <local-command-stdout> for a pending
@@ -2187,103 +2159,6 @@ mod tests {
                 let entry = &mu["opus-4"];
                 assert_eq!(entry.input_tokens, 80);
                 assert_eq!(entry.output_tokens, 40);
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    /// #149: context_tokens must reflect the LAST main-chain request's
-    /// (input + cache_read + cache_creation), NOT the cumulative result.usage which
-    /// sums across requests and over-counts context on multi-request (tool) turns.
-    #[test]
-    fn test_context_tokens_uses_last_request_not_cumulative() {
-        let mut ps = ProtocolState::new(false);
-        // Request 1: context ≈ 10 + 37071 + 6172
-        ps.map_event(
-            RUN,
-            &json!({
-                "type": "assistant",
-                "message": {
-                    "model": "claude-haiku-4-5",
-                    "content": [{"type": "text", "text": "step 1"}],
-                    "usage": {"input_tokens": 10, "cache_read_input_tokens": 37071, "cache_creation_input_tokens": 6172, "output_tokens": 7}
-                }
-            }),
-        );
-        // Request 2 (the last): context ≈ 8 + 0 + 115076
-        ps.map_event(
-            RUN,
-            &json!({
-                "type": "assistant",
-                "message": {
-                    "model": "claude-haiku-4-5",
-                    "content": [{"type": "text", "text": "DONE"}],
-                    "usage": {"input_tokens": 8, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 115076, "output_tokens": 1}
-                }
-            }),
-        );
-        // result.usage is CUMULATIVE (in=18, cc=121248) — must NOT be used for context.
-        let events = ps.map_event(
-            RUN,
-            &json!({
-                "type": "result",
-                "subtype": "success",
-                "usage": {"input_tokens": 18, "cache_read_input_tokens": 37071, "cache_creation_input_tokens": 121248, "output_tokens": 329}
-            }),
-        );
-        let usage = events
-            .iter()
-            .find(|e| matches!(e, BusEvent::UsageUpdate { .. }))
-            .unwrap();
-        match usage {
-            BusEvent::UsageUpdate { context_tokens, .. } => {
-                // Last request only: 8 + 0 + 115076 = 115084 (not the cumulative 158337).
-                assert_eq!(*context_tokens, Some(115_084));
-            }
-            _ => unreachable!(),
-        }
-        // Reset after the turn so the next turn starts fresh.
-        assert_eq!(ps.last_request_context, None);
-    }
-
-    /// Sub-agent (sidechain) assistant requests must NOT move the main context gauge.
-    #[test]
-    fn test_context_tokens_ignores_sidechain() {
-        let mut ps = ProtocolState::new(false);
-        // Main-chain request establishes context.
-        ps.map_event(
-            RUN,
-            &json!({
-                "type": "assistant",
-                "message": {
-                    "content": [{"type": "text", "text": "main"}],
-                    "usage": {"input_tokens": 100, "cache_read_input_tokens": 5000, "cache_creation_input_tokens": 0, "output_tokens": 10}
-                }
-            }),
-        );
-        // Sidechain request (parent_tool_use_id set) with a huge context — must be ignored.
-        ps.map_event(
-            RUN,
-            &json!({
-                "type": "assistant",
-                "parent_tool_use_id": "tu-subagent-1",
-                "message": {
-                    "content": [{"type": "text", "text": "sub"}],
-                    "usage": {"input_tokens": 999999, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "output_tokens": 1}
-                }
-            }),
-        );
-        let events = ps.map_event(
-            RUN,
-            &json!({"type": "result", "subtype": "success", "usage": {"input_tokens": 1, "output_tokens": 1}}),
-        );
-        let usage = events
-            .iter()
-            .find(|e| matches!(e, BusEvent::UsageUpdate { .. }))
-            .unwrap();
-        match usage {
-            BusEvent::UsageUpdate { context_tokens, .. } => {
-                assert_eq!(*context_tokens, Some(5_100)); // main-chain only
             }
             _ => unreachable!(),
         }
