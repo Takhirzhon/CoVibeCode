@@ -5285,4 +5285,213 @@ describe("SessionStore reducer", () => {
       expect(s.pendingToolPermissions[1].requestId).toBe("req-synth-2");
     });
   });
+
+  // ── latestTodos getter (drives the TodoPanel) ──
+
+  describe("latestTodos getter", () => {
+    const td = (content: string, status: "pending" | "in_progress" | "completed") => ({
+      content,
+      status,
+      activeForm: content,
+    });
+
+    function todoEvents(
+      useId: string,
+      todos: ReturnType<typeof td>[],
+      status: "success" | "error" = "success",
+    ): BusEvent[] {
+      return [
+        {
+          type: "tool_start",
+          run_id: "run-todo",
+          tool_use_id: useId,
+          tool_name: "TodoWrite",
+          input: { todos },
+        },
+        {
+          type: "tool_end",
+          run_id: "run-todo",
+          tool_use_id: useId,
+          tool_name: "TodoWrite",
+          status,
+          tool_use_result: { oldTodos: [], newTodos: todos },
+        },
+      ] as BusEvent[];
+    }
+
+    beforeEach(() => {
+      store.run = makeRun("run-todo");
+      store.phase = "running";
+    });
+
+    it("returns the most recent TodoWrite's newTodos", () => {
+      store.applyEventBatch(todoEvents("t1", [td("a", "completed"), td("b", "in_progress")]));
+      store.applyEventBatch(
+        todoEvents("t2", [td("a", "completed"), td("b", "completed"), td("c", "in_progress")]),
+      );
+      expect(store.latestTodos.map((t) => t.content)).toEqual(["a", "b", "c"]);
+      expect(store.latestTodos[1].status).toBe("completed");
+    });
+
+    it("ignores non-TodoWrite tools", () => {
+      store.applyEventBatch(todoEvents("t1", [td("a", "in_progress")]));
+      store.applyEventBatch([
+        {
+          type: "tool_start",
+          run_id: "run-todo",
+          tool_use_id: "bash-1",
+          tool_name: "Bash",
+          input: { command: "ls" },
+        },
+        {
+          type: "tool_end",
+          run_id: "run-todo",
+          tool_use_id: "bash-1",
+          tool_name: "Bash",
+          status: "success",
+          tool_use_result: { stdout: "x" },
+        },
+      ] as BusEvent[]);
+      expect(store.latestTodos.map((t) => t.content)).toEqual(["a"]);
+    });
+
+    it("returns [] when no TodoWrite has run", () => {
+      expect(store.latestTodos).toEqual([]);
+    });
+
+    it("skips a failed TodoWrite and keeps the last successful one", () => {
+      store.applyEventBatch(todoEvents("t1", [td("a", "completed")]));
+      store.applyEventBatch(todoEvents("t2", [td("b", "in_progress")], "error"));
+      expect(store.latestTodos.map((t) => t.content)).toEqual(["a"]);
+    });
+  });
+
+  // ── taskList / panelTasks (Tasks system: TaskCreate/TaskUpdate) ──
+
+  describe("taskList getter (Tasks system aggregation)", () => {
+    function taskCreate(id: string, subject: string): BusEvent[] {
+      return [
+        {
+          type: "tool_start",
+          run_id: "run-task",
+          tool_use_id: `c-${id}`,
+          tool_name: "TaskCreate",
+          input: { subject },
+        },
+        {
+          type: "tool_end",
+          run_id: "run-task",
+          tool_use_id: `c-${id}`,
+          tool_name: "TaskCreate",
+          status: "success",
+          tool_use_result: { task: { id, subject } },
+        },
+      ] as BusEvent[];
+    }
+
+    function taskUpdate(id: string, to: string, useId: string): BusEvent[] {
+      return [
+        {
+          type: "tool_start",
+          run_id: "run-task",
+          tool_use_id: useId,
+          tool_name: "TaskUpdate",
+          input: { taskId: id, status: to },
+        },
+        {
+          type: "tool_end",
+          run_id: "run-task",
+          tool_use_id: useId,
+          tool_name: "TaskUpdate",
+          status: "success",
+          tool_use_result: { taskId: id, statusChange: { from: "pending", to }, success: true },
+        },
+      ] as BusEvent[];
+    }
+
+    beforeEach(() => {
+      store.run = makeRun("run-task");
+      store.phase = "running";
+    });
+
+    it("aggregates TaskCreate into a pending list, preserving creation order", () => {
+      store.applyEventBatch(taskCreate("1", "build a.txt"));
+      store.applyEventBatch(taskCreate("2", "build b.txt"));
+      expect(store.taskList).toEqual([
+        { id: "1", text: "build a.txt", status: "pending" },
+        { id: "2", text: "build b.txt", status: "pending" },
+      ]);
+    });
+
+    it("applies TaskUpdate status changes by taskId", () => {
+      store.applyEventBatch(taskCreate("1", "a"));
+      store.applyEventBatch(taskCreate("2", "b"));
+      store.applyEventBatch(taskUpdate("1", "in_progress", "u1"));
+      store.applyEventBatch(taskUpdate("1", "completed", "u2"));
+      expect(store.taskList.map((t) => t.status)).toEqual(["completed", "pending"]);
+    });
+
+    it("removes a task when updated to deleted", () => {
+      store.applyEventBatch(taskCreate("1", "a"));
+      store.applyEventBatch(taskCreate("2", "b"));
+      store.applyEventBatch(taskUpdate("1", "deleted", "u1"));
+      expect(store.taskList.map((t) => t.id)).toEqual(["2"]);
+    });
+  });
+
+  describe("panelTasks getter (unified source)", () => {
+    beforeEach(() => {
+      store.run = makeRun("run-panel");
+      store.phase = "running";
+    });
+
+    it("prefers the Tasks system when TaskCreate events exist", () => {
+      store.applyEventBatch([
+        {
+          type: "tool_start",
+          run_id: "run-panel",
+          tool_use_id: "c1",
+          tool_name: "TaskCreate",
+          input: {},
+        },
+        {
+          type: "tool_end",
+          run_id: "run-panel",
+          tool_use_id: "c1",
+          tool_name: "TaskCreate",
+          status: "success",
+          tool_use_result: { task: { id: "1", subject: "from tasks" } },
+        },
+      ] as BusEvent[]);
+      expect(store.panelTasks).toEqual([{ id: "1", text: "from tasks", status: "pending" }]);
+    });
+
+    it("falls back to legacy TodoWrite when no Tasks events exist", () => {
+      store.applyEventBatch([
+        {
+          type: "tool_start",
+          run_id: "run-panel",
+          tool_use_id: "w1",
+          tool_name: "TodoWrite",
+          input: {},
+        },
+        {
+          type: "tool_end",
+          run_id: "run-panel",
+          tool_use_id: "w1",
+          tool_name: "TodoWrite",
+          status: "success",
+          tool_use_result: {
+            oldTodos: [],
+            newTodos: [{ content: "from todo", status: "in_progress", activeForm: "from todo" }],
+          },
+        },
+      ] as BusEvent[]);
+      expect(store.panelTasks).toEqual([{ id: "0", text: "from todo", status: "in_progress" }]);
+    });
+
+    it("returns [] when neither source has run", () => {
+      expect(store.panelTasks).toEqual([]);
+    });
+  });
 });

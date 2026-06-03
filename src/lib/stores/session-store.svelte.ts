@@ -18,6 +18,8 @@ import type {
   McpServerInfo,
   ElicitationSchema,
   SessionMode,
+  TodoItem,
+  PanelTask,
 } from "$lib/types";
 import { dbg, dbgWarn } from "$lib/utils/debug";
 import { yieldToMain } from "$lib/utils/yield";
@@ -515,6 +517,73 @@ export class SessionStore {
     }
     // Pipe/PTY fallback: use HookEvent tools array
     return this.tools.filter((e) => e.status === "running").at(-1)?.tool_name ?? "";
+  }
+
+  /**
+   * The most recent TodoWrite checklist (top-level timeline only, matching the
+   * `/todos` command). Empty when no TodoWrite has run — including all Codex
+   * sessions, since Codex's exec protocol never emits TodoWrite.
+   */
+  get latestTodos(): TodoItem[] {
+    for (let i = this.timeline.length - 1; i >= 0; i--) {
+      const e = this.timeline[i];
+      if (
+        e.kind === "tool" &&
+        e.tool.tool_name === "TodoWrite" &&
+        e.tool.status === "success" &&
+        e.tool.tool_use_result != null &&
+        typeof e.tool.tool_use_result === "object" &&
+        Array.isArray((e.tool.tool_use_result as Record<string, unknown>).newTodos)
+      ) {
+        return (e.tool.tool_use_result as unknown as { newTodos: TodoItem[] }).newTodos;
+      }
+    }
+    return [];
+  }
+
+  /**
+   * Current task list aggregated from the Tasks system (TaskCreate/TaskUpdate),
+   * which is incremental — there is no single full-snapshot event. We replay the
+   * timeline in order: each TaskCreate adds a row (pending), each TaskUpdate mutates
+   * its status by taskId; a "deleted" status removes the row. Creation order is kept.
+   */
+  get taskList(): PanelTask[] {
+    const byId = new Map<string, PanelTask>();
+    const order: string[] = [];
+    for (const e of this.timeline) {
+      if (e.kind !== "tool" || e.tool.status !== "success") continue;
+      const r = e.tool.tool_use_result as Record<string, unknown> | undefined;
+      if (r == null || typeof r !== "object") continue;
+      if (e.tool.tool_name === "TaskCreate") {
+        const task = r.task as { id?: string; subject?: string } | undefined;
+        if (task?.id) {
+          if (!byId.has(task.id)) order.push(task.id);
+          byId.set(task.id, { id: task.id, text: task.subject ?? "", status: "pending" });
+        }
+      } else if (e.tool.tool_name === "TaskUpdate") {
+        const taskId = r.taskId as string | undefined;
+        const to = (r.statusChange as { to?: string } | undefined)?.to;
+        if (taskId && to && byId.has(taskId)) {
+          if (to === "deleted") byId.delete(taskId);
+          else byId.get(taskId)!.status = to as PanelTask["status"];
+        }
+      }
+    }
+    return order.map((id) => byId.get(id)).filter((t): t is PanelTask => t != null);
+  }
+
+  /**
+   * Unified source for the TodoPanel and /todos: prefer the Tasks system, fall back
+   * to legacy TodoWrite snapshots. Empty for Codex (neither tool exists there).
+   */
+  get panelTasks(): PanelTask[] {
+    const tasks = this.taskList;
+    if (tasks.length > 0) return tasks;
+    return this.latestTodos.map((td, i) => ({
+      id: String(i),
+      text: td.content,
+      status: td.status,
+    }));
   }
 
   /** Recursive walk: short-circuit check for any permission_prompt in timeline + subTimelines. */
