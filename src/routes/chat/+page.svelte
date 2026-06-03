@@ -50,6 +50,7 @@
   import McpStatusPanel from "$lib/components/McpStatusPanel.svelte";
   import PromptInput from "$lib/components/PromptInput.svelte";
   import ScheduledTasksChip from "$lib/components/ScheduledTasksChip.svelte";
+  import TodoPanel from "$lib/components/TodoPanel.svelte";
   import PermissionPanel from "$lib/components/PermissionPanel.svelte";
   import ElicitationDialog from "$lib/components/ElicitationDialog.svelte";
   import AuthSourceBadge from "$lib/components/AuthSourceBadge.svelte";
@@ -2670,41 +2671,20 @@
       // Escape markdown special chars in todo content
       const esc = (s: string) => s.replace(/([\\*_~`[\]#>|])/g, "\\$1");
 
-      // Find the last TodoWrite tool_end in timeline with newTodos
-      const lastTodo = [...store.timeline]
-        .reverse()
-        .find(
-          (e): e is Extract<TimelineEntry, { kind: "tool" }> =>
-            e.kind === "tool" &&
-            e.tool.tool_name === "TodoWrite" &&
-            e.tool.status === "success" &&
-            e.tool.tool_use_result != null &&
-            typeof e.tool.tool_use_result === "object" &&
-            "newTodos" in e.tool.tool_use_result &&
-            Array.isArray(e.tool.tool_use_result.newTodos),
-        );
-
-      if (lastTodo) {
-        const todos = lastTodo.tool.tool_use_result!.newTodos as Array<{
-          content: string;
-          status: "pending" | "in_progress" | "completed";
-        }>;
-        if (todos.length === 0) {
-          appendCommandOutput(t("todos_empty"));
-        } else {
-          const lines = todos.map((td) => {
-            const text = esc(td.content);
-            if (td.status === "completed") return `- [x] ~~${text}~~`;
-            if (td.status === "in_progress") return `- [ ] **⏳ ${text}**`;
-            return `- [ ] ${text}`;
-          });
-          appendCommandOutput(lines.join("\n"));
-        }
-      } else {
-        // No TodoWrite in timeline — show local prompt
-        // CLI /todos is an internal command that doesn't produce timeline events,
-        // so fallback to sendMessage would just create an empty turn.
+      // Same source as the TodoPanel (Tasks system or legacy TodoWrite). Empty covers
+      // both "no tasks yet" and an empty list — CLI /todos produces no timeline event,
+      // so there's nothing to send.
+      const tasks = store.panelTasks;
+      if (tasks.length === 0) {
         appendCommandOutput(t("todos_empty"));
+      } else {
+        const lines = tasks.map((task) => {
+          const text = esc(task.text);
+          if (task.status === "completed") return `- [x] ~~${text}~~`;
+          if (task.status === "in_progress") return `- [ ] **⏳ ${text}**`;
+          return `- [ ] ${text}`;
+        });
+        appendCommandOutput(lines.join("\n"));
       }
     } else if (action === "show-diff") {
       const cwd = store.effectiveCwd || localStorage.getItem("ocv:project-cwd") || "";
@@ -4889,6 +4869,8 @@
       onCancel={(id) => store.sendMessage(`Cancel scheduled task ${id}`, [])}
       onList={() => store.sendMessage("Show me my scheduled tasks", [])}
     />
+
+    <TodoPanel tasks={store.panelTasks} />
 
     {#if store.sessionAlive || !store.run || store.phase === "empty" || store.phase === "ready" || TERMINAL_PHASES.includes(store.phase)}
       <PromptInput

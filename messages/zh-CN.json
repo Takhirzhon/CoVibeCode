@@ -1390,6 +1390,8 @@
   "hooks_refresh": "刷新",
 
   "todos_empty": "当前没有待办事项。",
+  "todos_panelHeader": "任务",
+  "todos_panelSummary": "{done}/{total} 完成",
 
   "slashTasks_empty": "当前会话没有后台任务。",
   "slashTasks_notFound": "未找到任务：{id}",
