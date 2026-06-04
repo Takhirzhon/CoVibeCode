@@ -1,0 +1,40 @@
+# Normalize line endings across platforms.
+# Without this, `core.autocrlf=true` checks out CRLF on Windows, which breaks
+# the prettier pre-commit hook (it expects LF) and produces noisy diffs.
+# `eol=lf` forces an LF working tree on every platform, overriding autocrlf.
+
+* text=auto eol=lf
+
+# ── Scripts that must keep platform-native endings ──
+*.sh   text eol=lf
+*.bash text eol=lf
+*.cmd  text eol=crlf
+*.bat  text eol=crlf
+*.ps1  text eol=crlf
+
+# ── Binary assets — never normalize or diff as text ──
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.icns  binary
+*.webp  binary
+*.svg   text eol=lf
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.otf   binary
+*.eot   binary
+*.pdf   binary
+*.exe   binary
+*.dll   binary
+*.wasm  binary
+*.msi   binary
+*.zip   binary
+*.gz    binary
+*.mp4   binary
+*.mov   binary
+
+# Encrypted Pencil design files — opaque, treat as binary.
+*.pen   binary
