@@ -1598,6 +1598,27 @@
       handleTauriDrop,
     );
 
+    // Defensive recovery for a stuck drag-hover overlay (#103). Native
+    // tauri://drag-leave / drag-drop events can be dropped on some platforms
+    // (notably Windows), leaving pageDragActive stuck true — its full-screen z-50
+    // overlay then swallows every click and the UI appears frozen. A pointer event
+    // cannot reach the webview during an OS file drag, so receiving one means the
+    // drag has ended; Escape is a manual escape hatch. We only clear the hover
+    // overlay, never dragProcessing (real in-flight work). Capture phase so a
+    // stopPropagation elsewhere can't defeat the recovery.
+    const clearStuckDragHover = () => {
+      if (pageDragActive) {
+        dbg("chat", "clearing stuck drag-hover overlay");
+        pageDragActive = false;
+      }
+    };
+    const onPointerDownClearDrag = () => clearStuckDragHover();
+    const onEscapeClearDrag = (e: KeyboardEvent) => {
+      if (e.key === "Escape") clearStuckDragHover();
+    };
+    window.addEventListener("pointerdown", onPointerDownClearDrag, true);
+    window.addEventListener("keydown", onEscapeClearDrag, true);
+
     // Preview window event listeners
     const previewSelectionUnlisten = chatTransport.listen<{
       instanceId: string;
@@ -1649,6 +1670,8 @@
       dragEnterUnlisten.then((fn) => fn());
       dragLeaveUnlisten.then((fn) => fn());
       dragDropUnlisten.then((fn) => fn());
+      window.removeEventListener("pointerdown", onPointerDownClearDrag, true);
+      window.removeEventListener("keydown", onEscapeClearDrag, true);
       previewSelectionUnlisten.then((fn) => fn());
       previewClosedUnlisten.then((fn) => fn());
       // Clean up verbose retry timer
