@@ -1058,21 +1058,27 @@ impl ProtocolState {
                                     .collect::<HashMap<_, _>>()
                             });
 
-                    // Recalculate cost using our pricing table for accurate third-party model costs.
-                    // CLI uses its own (often Claude-based) pricing, which is wrong for providers
-                    // like DeepSeek, MiniMax, etc.
+                    // Cost per model: trust the CLI's own costUSD for native Claude/OpenAI
+                    // models (the CLI knows its exact pricing — tiers, batch, etc. — better
+                    // than our static table). Only third-party providers (DeepSeek, MiniMax,
+                    // GLM, …) get Claude-based pricing wrong, so we recalculate those from
+                    // our table. (#149 / upstream #151)
                     let (cost, model_usage) = if let Some(mut mu) = model_usage {
                         let mut total = 0.0_f64;
                         for (model_name, entry) in mu.iter_mut() {
-                            let recalculated = crate::pricing::estimate_cost(
-                                model_name,
-                                entry.input_tokens,
-                                entry.output_tokens,
-                                entry.cache_read_tokens,
-                                entry.cache_write_tokens,
-                            );
-                            entry.cost_usd = recalculated;
-                            total += recalculated;
+                            if crate::pricing::is_native_pricing_model(model_name) {
+                                total += entry.cost_usd; // CLI value (from costUSD)
+                            } else {
+                                let recalculated = crate::pricing::estimate_cost(
+                                    model_name,
+                                    entry.input_tokens,
+                                    entry.output_tokens,
+                                    entry.cache_read_tokens,
+                                    entry.cache_write_tokens,
+                                );
+                                entry.cost_usd = recalculated;
+                                total += recalculated;
+                            }
                         }
                         (total, Some(mu))
                     } else {
