@@ -179,6 +179,23 @@ fn claude_pricing(input: f64, output: f64) -> ModelPricing {
     }
 }
 
+/// Whether the Claude Code CLI reports accurate cost for this model itself.
+///
+/// The CLI natively bills Claude (and OpenAI) models with correct pricing, so we
+/// trust its reported `costUSD` for them. Third-party providers proxied through the
+/// CLI get Claude-based pricing applied — which is wrong — so those we recalculate
+/// via [`estimate_cost`]. (#149 / upstream #151)
+pub fn is_native_pricing_model(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m.contains("claude")
+        || m.contains("opus")
+        || m.contains("sonnet")
+        || m.contains("haiku")
+        || m.contains("gpt")
+        || m.contains("o1")
+        || m.contains("o3")
+}
+
 /// Estimate cost from token counts (input, output, cache read, cache write).
 pub fn estimate_cost(
     model: &str,
@@ -240,5 +257,33 @@ mod tests {
         assert!(cost < legacy, "modern Opus must cost less than legacy");
         // Modern: 5k*5 + 6k*25 + 60k*0.5 + 10k*6.25 = 25k+150k+30k+62.5k = 267.5k /1e6 = $0.2675
         assert!((cost - 0.2675).abs() < 1e-6, "got {cost}");
+    }
+
+    /// #151 refinement: native Claude/OpenAI models trust the CLI's own cost;
+    /// third-party providers are recalculated from our table.
+    #[test]
+    fn native_pricing_model_classification() {
+        for native in [
+            "claude-opus-4-8",
+            "claude-sonnet-4-6",
+            "haiku",
+            "gpt-4o",
+            "o3-mini",
+        ] {
+            assert!(is_native_pricing_model(native), "{native} should be native");
+        }
+        for third_party in [
+            "deepseek-chat",
+            "kimi-k2.5",
+            "glm-4.7",
+            "qwen3-max",
+            "MiniMax-M2.5",
+            "doubao-pro",
+        ] {
+            assert!(
+                !is_native_pricing_model(third_party),
+                "{third_party} should be third-party"
+            );
+        }
     }
 }

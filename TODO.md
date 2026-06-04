@@ -52,6 +52,7 @@
   - **Context** (`claude_protocol.rs` + `models.rs` + frontend): backend now tracks the **last main-chain request's** `input+cache_read+cache_creation` and emits it as a new `UsageUpdate.context_tokens`; the cumulative fields stay for cost/stats. Frontend gauge (`session-store.svelte.ts`) uses `ev.context_tokens ?? <sum>` (fallback for old events). Sub-agent/sidechain requests are excluded. CLI imports set it per-message.
   - **Tests:** `pricing::tests` (3) + `claude_protocol::tests::test_context_tokens_*` (2) — all green. Full backend suite: 430 pass / 9 pre-existing Windows-only failures (clipboard/path tests, unrelated).
   - Note: cache_write kept at $6.25 (5-min, CC default) rather than the issue's suggested $10 (1-hr rate), consistent with how 4.5/4.6 are already priced.
+  - **Refinement 2026-06-04 (from upstream PR #151):** cost now **trusts the CLI's own `costUSD` for native Claude/OpenAI models** (the CLI is authoritative for its own pricing — tiers/batch/etc.) and only recalculates **third-party** providers via our table. New `pricing::is_native_pricing_model`. Upstream independently fixed #149 the same way (last-request context + inverted Opus table) → expect a conflict if we ever merge their #151.
   - Related closed issue: upstream #135 (top-bar token/turn counter).
 - **Owner:** Claude  ·  **Status:** `[x]` (fixed + tested)
 
@@ -113,8 +114,10 @@
   - Backend event read (`storage/events.rs`) uses `filter_map(serde_json::from_str(...).ok())` — malformed JSONL lines are **skipped, not panicked**. A corrupt session log won't crash the process.
   - Frontend load (`loadRun` → `applyEventBatchAsync`) **yields between chunks**, so a large session won't block the main thread indefinitely.
   - Remaining most-likely cause: **WebView2 rendering crash** on a single huge payload (e.g. a massive tool output / code block) in one specific session → "blank → hang → auto-exit" matches a renderer OOM/crash on Windows. Unconfirmed without repro.
-- **BLOCKED — needs a reproducing session.** To unblock, capture from an affected machine: (1) Windows build number (`winver`), (2) app version, (3) WebView2 runtime version, (4) `%APPDATA%`/log output around the crash, (5) ideally the `events.jsonl` of the session that triggers it (or its size + largest event). Then we can repro and fix with confidence.
-- **Owner:** _unassigned (blocked on repro)_  ·  **Status:** `[ ]`
+- **🩹 LIKELY-FIXED 2026-06-04 (Claude) — re-implemented upstream PR #152.** Strong newly-found candidate cause: a **stuck drag-hover overlay**. Native `tauri://drag-leave`/`drag-drop` events can be dropped on Windows, leaving `pageDragActive` stuck `true`; its full-screen `z-50` overlay (`chat/+page.svelte`) then swallows every click → "blank, frozen" exactly as reported.
+  - Fix: defensive `pointerdown` + `Escape` (capture-phase) window handlers clear the stuck overlay without touching `dragProcessing` (real in-flight work). `chat/+page.svelte`.
+  - ⚠️ Unconfirmed against the original reporter's session (still no repro), but this is the most plausible mechanism and the fix is low-risk. If "blank/hang" recurs after this, fall back to the WebView2-crash hypothesis and capture: `winver`, app version, WebView2 runtime version, logs, and the triggering `events.jsonl`.
+- **Owner:** Claude  ·  **Status:** `[~]` (mitigation applied; verify in the wild)
 
 ---
 
