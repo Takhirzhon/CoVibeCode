@@ -681,6 +681,13 @@ pub fn update_user_settings(patch: serde_json::Value) -> Result<UserSettings, St
     if let Some(v) = patch.get("onboarding_completed") {
         all.user.onboarding_completed = v.as_bool().unwrap_or(false);
     }
+    if let Some(v) = patch.get("task_completion_sound_enabled") {
+        all.user.task_completion_sound_enabled = if v.is_null() { None } else { v.as_bool() };
+    }
+    if let Some(v) = patch.get("task_completion_sound") {
+        all.user.task_completion_sound =
+            v.as_str().filter(|s| !s.is_empty()).map(|s| s.to_string());
+    }
     all.user.updated_at = crate::models::now_iso();
     save(&all)?;
     Ok(all.user)

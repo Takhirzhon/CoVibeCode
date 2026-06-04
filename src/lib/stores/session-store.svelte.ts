@@ -5,6 +5,7 @@
  * with a state-machine (SessionPhase) + organized fields + idempotent reducers.
  */
 import * as api from "$lib/api";
+import { playCompletionSound, loadCompletionSoundPref } from "$lib/utils/completion-sound";
 import type {
   TaskRun,
   RunStatus,
@@ -374,6 +375,7 @@ export class SessionStore {
 
   /** Set phase with dev-mode transition guard. */
   private _setPhase(to: SessionPhase): void {
+    const from = this.phase;
     assertTransition(this.phase, to);
     this.phase = to;
     // Any phase change away from spawning clears the spawn timeout
@@ -383,6 +385,14 @@ export class SessionStore {
     // Clear response timeout on terminal/idle phases
     if (to !== "running") {
       this._clearResponseTimeout();
+    }
+    // Task-completion sound (#123): an active turn just finished. Skip during
+    // historical replay/load so merely opening a finished session stays silent.
+    // _setPhase is foreground-only (background tasks set ctx.phase directly).
+    const wasActive = from === "running" || from === "spawning";
+    const isDone = to === "idle" || to === "completed" || to === "failed";
+    if (wasActive && isDone && !this._isLoadingReplay) {
+      playCompletionSound();
     }
   }
 
@@ -1606,6 +1616,7 @@ export class SessionStore {
     const gen = ++this._loadGen;
     const loadStart = performance.now();
     dbg("store", "loadRun id=", id, "gen=", gen);
+    void loadCompletionSoundPref(); // cached; ensures the sound pref is ready before any turn completes (#123)
 
     if (!id) {
       this.reset();
@@ -1838,6 +1849,7 @@ export class SessionStore {
   ): Promise<string> {
     this.error = "";
     this._setPhase("spawning");
+    void loadCompletionSoundPref(); // cached; ready before this turn completes (#123)
 
     try {
       // Refresh platformId and permissionMode from latest settings for new sessions.

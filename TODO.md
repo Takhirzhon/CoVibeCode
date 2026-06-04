@@ -69,7 +69,14 @@
 ### 🟢 NEW FEATURE · `S–M` · [#123] Sound notification on task completion
 - **Issue:** [#123](https://github.com/AnyiWang/OpenCovibe/issues/123)
 - **Ask:** Play a sound when a task completes (visual notifications get missed in multi-window/full-screen). Settings toggle + sound choice (system default / custom file / built-in). Frontend Web Audio API.
-- **Owner:** _unassigned_  ·  **Status:** `[ ]`
+- **✅ DONE 2026-06-04 (Claude).**
+  - New `src/lib/utils/completion-sound.ts`: Web Audio API synthesis (no bundled assets), 3 built-in styles (chime/ping/beep), cached pref for a synchronous hot path.
+  - Plays in `session-store._setPhase` when an active turn (running/spawning) → done (idle/completed/failed); skipped during replay/load and for background-task contexts.
+  - Settings: `task_completion_sound_enabled` + `task_completion_sound` (`models.rs`/`settings.rs`/`types.ts`). New "Notifications" card in Settings → General: toggle + style picker + preview (en + zh-CN i18n).
+  - Verified: rustfmt, eslint, svelte-check (0 err), i18n (0 err), 22 settings + 279 session-store tests pass.
+  - Scoped out (future): custom sound-file upload (built-in styles only for now).
+  - ⚠️ Manual check: confirm audibility in the running app (audio output can't be unit-tested).
+- **Owner:** Claude  ·  **Status:** `[x]` (done)
 
 ### 🟢 NEW FEATURE · `M` · [#128] Delete / archive conversations
 - **Issue:** [#128](https://github.com/AnyiWang/OpenCovibe/issues/128)
