@@ -39,6 +39,11 @@
   import { IS_WINDOWS } from "$lib/utils/platform";
   import { t, LOCALE_REGISTRY, currentLocale, switchLocale } from "$lib/i18n/index.svelte";
   import { getTransport } from "$lib/transport";
+  import {
+    COMPLETION_SOUND_STYLES,
+    setCompletionSoundPref,
+    previewCompletionSound,
+  } from "$lib/utils/completion-sound";
 
   // ── Tab state ──
   type SettingsTab = "general" | "connection" | "cli-config" | "shortcuts" | "remote" | "debug";
@@ -280,6 +285,39 @@
     pendingZoom = null;
     void applyZoomQueued(factor);
   }
+
+  // ── Task completion sound (#123) ──
+  let soundEnabled = $state(false);
+  let soundStyle = $state<string>("chime");
+  let soundSaved = $state(false);
+
+  $effect(() => {
+    if (settings) {
+      soundEnabled = settings.task_completion_sound_enabled ?? false;
+      soundStyle = settings.task_completion_sound ?? "chime";
+    }
+  });
+
+  async function saveSoundSettings(next: { enabled?: boolean; style?: string }) {
+    const enabled = next.enabled ?? soundEnabled;
+    const style = next.style ?? soundStyle;
+    soundEnabled = enabled;
+    soundStyle = style;
+    // Update the in-memory pref immediately so the next turn uses it without a reload.
+    setCompletionSoundPref(enabled, style);
+    if (enabled) previewCompletionSound(style); // audible confirmation of the choice
+    try {
+      settings = await api.updateUserSettings({
+        task_completion_sound_enabled: enabled,
+        task_completion_sound: style,
+      });
+      soundSaved = true;
+      setTimeout(() => (soundSaved = false), 1500);
+    } catch (e) {
+      dbgWarn("settings", "saveSoundSettings failed", e);
+    }
+  }
+
   let logCount = $state(getDebugLogCount());
   let rustCmdCopied = $state(false);
   let currentUsername = $state("");
@@ -1437,6 +1475,84 @@
               </span>
             </div>
           </div>
+        </Card>
+
+        <!-- Notifications Card -->
+        <Card class="p-6 space-y-4">
+          <div class="flex items-center justify-between">
+            <h2 class="text-sm font-semibold text-muted-foreground uppercase tracking-wider">
+              {t("settings_general_notifications")}
+            </h2>
+            {#if soundSaved}
+              <span class="text-xs text-emerald-500 flex items-center gap-1 animate-fade-in">
+                <svg
+                  class="h-3 w-3"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"><path d="M20 6 9 17l-5-5" /></svg
+                >
+                {t("settings_general_saved")}
+              </span>
+            {/if}
+          </div>
+
+          <!-- Enabled toggle -->
+          <div class="flex items-center justify-between">
+            <div>
+              <p class="text-sm font-medium">{t("settings_general_completionSound")}</p>
+              <p class="text-xs text-muted-foreground">
+                {t("settings_general_completionSoundDesc")}
+              </p>
+            </div>
+            <button
+              class="relative inline-flex h-6 w-11 items-center rounded-full transition-colors {soundEnabled
+                ? 'bg-primary'
+                : 'bg-muted'}"
+              onclick={() => saveSoundSettings({ enabled: !soundEnabled })}
+            >
+              <span
+                class="inline-block h-4 w-4 transform rounded-full bg-white transition-transform {soundEnabled
+                  ? 'translate-x-6'
+                  : 'translate-x-1'}"
+              ></span>
+            </button>
+          </div>
+
+          <!-- Sound style picker + preview (only when enabled) -->
+          {#if soundEnabled}
+            <div class="flex items-center justify-between gap-4">
+              <div>
+                <p class="text-sm font-medium">{t("settings_general_completionSoundStyle")}</p>
+                <p class="text-xs text-muted-foreground">
+                  {t("settings_general_completionSoundStyleDesc")}
+                </p>
+              </div>
+              <div class="flex items-center gap-1.5">
+                {#each COMPLETION_SOUND_STYLES as style}
+                  <button
+                    class="rounded-md border px-3 py-1.5 text-xs transition-all duration-150 {soundStyle ===
+                    style
+                      ? 'bg-primary text-primary-foreground'
+                      : 'hover:bg-accent'}"
+                    onclick={() => saveSoundSettings({ style })}
+                  >
+                    {t(`settings_general_completionSound_${style}`)}
+                  </button>
+                {/each}
+                <button
+                  class="rounded-md border px-2 py-1.5 text-xs text-muted-foreground hover:bg-accent transition-colors"
+                  title={t("settings_general_completionSoundPreview")}
+                  aria-label={t("settings_general_completionSoundPreview")}
+                  onclick={() => previewCompletionSound(soundStyle)}
+                >
+                  ▶
+                </button>
+              </div>
+            </div>
+          {/if}
         </Card>
 
         <!-- Web Server Card (desktop only) -->

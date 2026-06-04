@@ -150,6 +150,10 @@ export interface UserSettings {
   web_server_bind?: string;
   web_server_allowed_origins?: string[];
   web_server_tunnel_url?: string;
+  /** Play a sound when a session turn completes (#123). */
+  task_completion_sound_enabled?: boolean;
+  /** Completion sound style: "chime" | "ping" | "beep". */
+  task_completion_sound?: string;
   updated_at: string;
 }
 

@@ -261,6 +261,12 @@ pub struct UserSettings {
     pub web_server_allowed_origins: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_server_tunnel_url: Option<String>,
+    /// Play a sound when a session turn completes (#123).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_completion_sound_enabled: Option<bool>,
+    /// Completion sound style: "chime" | "ping" | "beep".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_completion_sound: Option<String>,
     pub updated_at: String,
 }
 
@@ -349,6 +355,8 @@ impl Default for UserSettings {
             web_server_bind: None,
             web_server_allowed_origins: None,
             web_server_tunnel_url: None,
+            task_completion_sound_enabled: None,
+            task_completion_sound: None,
             updated_at: now_iso(),
         }
     }
