@@ -1108,13 +1108,6 @@ pub enum BusEvent {
         /// 1-hour ephemeral cache creation tokens.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cache_creation_1h: Option<u64>,
-        /// Current context-window occupancy = the LAST main-chain request's
-        /// (input + cache_read + cache_creation) tokens. The other token fields above
-        /// are CUMULATIVE across all requests in the turn (correct for cost/stats), so
-        /// they over-count context on multi-request (tool-using) turns. Use this field
-        /// for the context gauge instead. None for old events → frontend falls back. (#149)
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        context_tokens: Option<u64>,
     },
     Raw {
         run_id: String,

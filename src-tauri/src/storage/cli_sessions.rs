@@ -393,11 +393,6 @@ impl TranscriptImporter {
                 web_fetch_requests: None,
                 cache_creation_5m: None,
                 cache_creation_1h: None,
-                // Transcript usage is per-message (one request), so this already reflects
-                // the request's context occupancy — no cumulative over-count here. (#149)
-                context_tokens: Some(
-                    input_tokens + cache_read.unwrap_or(0) + cache_write.unwrap_or(0),
-                ),
             })
         } else {
             self.usage_incomplete = true;
