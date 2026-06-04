@@ -3293,7 +3293,13 @@ export class SessionStore {
         // window; clamp tokens to it so an over-counted snapshot can't exceed 100%. Only
         // raise tokens, but always adopt the latest non-zero window (200k↔1m can switch). #135
         if (hasTokens) {
-          const evUsed = u.inputTokens + u.cacheReadTokens + u.cacheWriteTokens;
+          // Prefer backend-supplied context_tokens (the LAST main-chain request's
+          // input + cache_read + cache_creation). The merged u.* token fields are
+          // CUMULATIVE across the turn's requests, which over-counts context on
+          // multi-request (tool-using) turns. Fall back to the sum for old events
+          // emitted before context_tokens existed. (#149)
+          const evUsed =
+            ev.context_tokens ?? u.inputTokens + u.cacheReadTokens + u.cacheWriteTokens;
           let evWin = 0;
           if (u.modelUsage) {
             for (const e of Object.values(u.modelUsage)) {

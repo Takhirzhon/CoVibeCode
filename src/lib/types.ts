@@ -909,6 +909,10 @@ export type BusEvent =
       web_fetch_requests?: number;
       cache_creation_5m?: number;
       cache_creation_1h?: number;
+      /** Context-window occupancy = LAST main-chain request's (input + cache_read +
+       *  cache_creation). The token fields above are cumulative across the turn and
+       *  over-count context on multi-request turns; prefer this for the gauge. (#149) */
+      context_tokens?: number;
     }
   | { type: "raw"; run_id: string; source: string; data: Record<string, unknown> }
   | { type: "thinking_delta"; run_id: string; text: string; parent_tool_use_id?: string }
