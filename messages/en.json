@@ -1399,6 +1399,8 @@
   "hooks_refresh": "Refresh",
 
   "todos_empty": "No todos currently tracked.",
+  "todos_panelHeader": "Tasks",
+  "todos_panelSummary": "{done}/{total} done",
 
   "slashTasks_empty": "No background tasks in this session.",
   "slashTasks_notFound": "Task not found: {id}",

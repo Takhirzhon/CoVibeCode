@@ -18,6 +18,8 @@ import type {
   McpServerInfo,
   ElicitationSchema,
   SessionMode,
+  TodoItem,
+  PanelTask,
 } from "$lib/types";
 import { dbg, dbgWarn } from "$lib/utils/debug";
 import { yieldToMain } from "$lib/utils/yield";
@@ -127,6 +129,8 @@ interface ReduceCtx {
   /** High-water context tokens / window since last compaction (drives contextUtilization). */
   contextHwTokens: number;
   contextHwWindow: number;
+  /** Context tokens of the last request in the current turn (drives context occupancy, #149). */
+  lastReqContextTokens: number;
   /** tool_use_id → tl[] index (only tool entries, first-match semantics). */
   toolTlIndex: Map<string, number>;
   /** tool_use_id → he[] index (only HookEvent entries with tool_use_id). */
@@ -323,6 +327,12 @@ export class SessionStore {
    *  window so a dip event without modelUsage doesn't zero the denominator. */
   contextHwTokens: number = $state(0);
   contextHwWindow: number = $state(0);
+  /** Context tokens of the LAST request in the current turn (input + cache_read +
+   *  cache_creation from the final assistant message_usage). Context occupancy is a
+   *  point-in-time measure, so it must use the last request — NOT the turn-summed
+   *  result usage, which multiplies cache_read by the request count (#149). 0 until
+   *  a message with usage arrives; the result handler falls back to summed usage then. */
+  lastReqContextTokens: number = $state(0);
   /** Timestamp of the most recent compact_boundary event (0 = never). */
   lastCompactedAt: number = $state(0);
   /** Number of full compaction events in this session. */
@@ -515,6 +525,73 @@ export class SessionStore {
     }
     // Pipe/PTY fallback: use HookEvent tools array
     return this.tools.filter((e) => e.status === "running").at(-1)?.tool_name ?? "";
+  }
+
+  /**
+   * The most recent TodoWrite checklist (top-level timeline only, matching the
+   * `/todos` command). Empty when no TodoWrite has run — including all Codex
+   * sessions, since Codex's exec protocol never emits TodoWrite.
+   */
+  get latestTodos(): TodoItem[] {
+    for (let i = this.timeline.length - 1; i >= 0; i--) {
+      const e = this.timeline[i];
+      if (
+        e.kind === "tool" &&
+        e.tool.tool_name === "TodoWrite" &&
+        e.tool.status === "success" &&
+        e.tool.tool_use_result != null &&
+        typeof e.tool.tool_use_result === "object" &&
+        Array.isArray((e.tool.tool_use_result as Record<string, unknown>).newTodos)
+      ) {
+        return (e.tool.tool_use_result as unknown as { newTodos: TodoItem[] }).newTodos;
+      }
+    }
+    return [];
+  }
+
+  /**
+   * Current task list aggregated from the Tasks system (TaskCreate/TaskUpdate),
+   * which is incremental — there is no single full-snapshot event. We replay the
+   * timeline in order: each TaskCreate adds a row (pending), each TaskUpdate mutates
+   * its status by taskId; a "deleted" status removes the row. Creation order is kept.
+   */
+  get taskList(): PanelTask[] {
+    const byId = new Map<string, PanelTask>();
+    const order: string[] = [];
+    for (const e of this.timeline) {
+      if (e.kind !== "tool" || e.tool.status !== "success") continue;
+      const r = e.tool.tool_use_result as Record<string, unknown> | undefined;
+      if (r == null || typeof r !== "object") continue;
+      if (e.tool.tool_name === "TaskCreate") {
+        const task = r.task as { id?: string; subject?: string } | undefined;
+        if (task?.id) {
+          if (!byId.has(task.id)) order.push(task.id);
+          byId.set(task.id, { id: task.id, text: task.subject ?? "", status: "pending" });
+        }
+      } else if (e.tool.tool_name === "TaskUpdate") {
+        const taskId = r.taskId as string | undefined;
+        const to = (r.statusChange as { to?: string } | undefined)?.to;
+        if (taskId && to && byId.has(taskId)) {
+          if (to === "deleted") byId.delete(taskId);
+          else byId.get(taskId)!.status = to as PanelTask["status"];
+        }
+      }
+    }
+    return order.map((id) => byId.get(id)).filter((t): t is PanelTask => t != null);
+  }
+
+  /**
+   * Unified source for the TodoPanel and /todos: prefer the Tasks system, fall back
+   * to legacy TodoWrite snapshots. Empty for Codex (neither tool exists there).
+   */
+  get panelTasks(): PanelTask[] {
+    const tasks = this.taskList;
+    if (tasks.length > 0) return tasks;
+    return this.latestTodos.map((td, i) => ({
+      id: String(i),
+      text: td.content,
+      status: td.status,
+    }));
   }
 
   /** Recursive walk: short-circuit check for any permission_prompt in timeline + subTimelines. */
@@ -1117,6 +1194,7 @@ export class SessionStore {
       turnUsages: [...this.turnUsages],
       contextHwTokens: this.contextHwTokens,
       contextHwWindow: this.contextHwWindow,
+      lastReqContextTokens: this.lastReqContextTokens,
       toolTlIndex: batchTlIndex,
       toolHeIndex: batchHeIndex,
       toolInputByUseId: new Map<string, Record<string, unknown>>(),
@@ -1164,6 +1242,7 @@ export class SessionStore {
     this.turnUsages = ctx.turnUsages;
     this.contextHwTokens = ctx.contextHwTokens;
     this.contextHwWindow = ctx.contextHwWindow;
+    this.lastReqContextTokens = ctx.lastReqContextTokens;
     this._seenMessageIds = ctx.seenMessageIds;
     this._seenToolIds = ctx.seenToolIds;
     this._toolTlIndex = ctx.toolTlIndex;
@@ -1371,6 +1450,7 @@ export class SessionStore {
     this.turnUsages = [];
     this.contextHwTokens = 0;
     this.contextHwWindow = 0;
+    this.lastReqContextTokens = 0;
     this.lastCompactedAt = 0;
     this.compactCount = 0;
     this.microcompactCount = 0;
@@ -1434,6 +1514,7 @@ export class SessionStore {
       turnUsages: this.turnUsages,
       contextHwTokens: this.contextHwTokens,
       contextHwWindow: this.contextHwWindow,
+      lastReqContextTokens: this.lastReqContextTokens,
       _seenMessageIds: [...this._seenMessageIds],
       _seenToolIds: [...this._seenToolIds],
       // B group (direct fields)
@@ -1514,6 +1595,7 @@ export class SessionStore {
       this.turnUsages = (obj.turnUsages ?? []) as TurnUsage[];
       this.contextHwTokens = (obj.contextHwTokens as number) ?? 0;
       this.contextHwWindow = (obj.contextHwWindow as number) ?? 0;
+      this.lastReqContextTokens = (obj.lastReqContextTokens as number) ?? 0;
       this._seenMessageIds = new Set((obj._seenMessageIds ?? []) as string[]);
       this._seenToolIds = new Set((obj._seenToolIds ?? []) as string[]);
 
@@ -2802,6 +2884,24 @@ export class SessionStore {
             len: savedThinking.length,
           });
 
+        // Track this request's context size (input + cache_read + cache_creation). Context
+        // occupancy is point-in-time, so the result handler uses the LAST request's value
+        // instead of the turn-summed result usage, which multiplies cache_read by request
+        // count (#149). Main-session messages only — subagent usage is its own context.
+        if (ev.message_usage) {
+          const mu = ev.message_usage;
+          const num = (k: string) => (typeof mu[k] === "number" ? (mu[k] as number) : 0);
+          const reqCtx =
+            num("input_tokens") +
+            num("cache_read_input_tokens") +
+            num("cache_creation_input_tokens");
+          if (reqCtx > 0) {
+            if (ctx) ctx.lastReqContextTokens = reqCtx;
+            else this.lastReqContextTokens = reqCtx;
+            dbg("store", "lastReqContextTokens", { reqCtx });
+          }
+        }
+
         this._pushTimeline(ctx, entry);
         break;
       }
@@ -3305,13 +3405,12 @@ export class SessionStore {
         // window; clamp tokens to it so an over-counted snapshot can't exceed 100%. Only
         // raise tokens, but always adopt the latest non-zero window (200k↔1m can switch). #135
         if (hasTokens) {
-          // Prefer backend-supplied context_tokens (the LAST main-chain request's
-          // input + cache_read + cache_creation). The merged u.* token fields are
-          // CUMULATIVE across the turn's requests, which over-counts context on
-          // multi-request (tool-using) turns. Fall back to the sum for old events
-          // emitted before context_tokens existed. (#149)
+          // Context occupancy = the LAST request's tokens, NOT the turn-summed result usage,
+          // which inflates cache_read by the request count (#149). Fall back to the summed
+          // usage for older runs whose message events carry no per-request usage.
+          const lastReq = (ctx ?? this).lastReqContextTokens;
           const evUsed =
-            ev.context_tokens ?? u.inputTokens + u.cacheReadTokens + u.cacheWriteTokens;
+            lastReq > 0 ? lastReq : u.inputTokens + u.cacheReadTokens + u.cacheWriteTokens;
           let evWin = 0;
           if (u.modelUsage) {
             for (const e of Object.values(u.modelUsage)) {
@@ -3499,6 +3598,7 @@ export class SessionStore {
           // post-compaction peak. Keep the window (denominator unchanged by compaction). #135
           const hwTgt = ctx ?? this;
           hwTgt.contextHwTokens = 0;
+          hwTgt.lastReqContextTokens = 0;
         }
         // Only set lastCompactedAt during live mode — during replay
         // the timestamp would be meaningless (Date.now() ≠ original event time).
