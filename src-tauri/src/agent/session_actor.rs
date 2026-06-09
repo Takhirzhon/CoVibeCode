@@ -89,7 +89,6 @@ pub struct RalphCancelResult {
 /// Used for diagnosing hard-timeout causes.
 #[derive(Debug)]
 struct PendingInteractiveRequest {
-    request_id: String,
     /// "can_use_tool" | "hook_callback" | "elicitation"
     subtype: String,
     /// tool_name / hook event / server name
@@ -231,9 +230,12 @@ struct SessionActor {
 
     // ── Observability: pending interactive request tracking ──
     /// Tracks the most recent interactive control request awaiting user response.
-    /// Set when emitting PermissionPrompt / HookCallback(PreToolUse) / ElicitationPrompt.
-    /// Cleared when the response is received. Retained during quarantine for diagnostics.
-    pending_interactive_request: Option<PendingInteractiveRequest>,
+    /// Pending interactive requests keyed by request_id (one per PermissionPrompt /
+    /// HookCallback(PreToolUse) / ElicitationPrompt). A single turn can have MANY
+    /// concurrent prompts (parallel tool use), so this must be a map, not a single
+    /// slot — otherwise a later prompt clobbers the earlier ones' timeout diagnostics.
+    /// Each entry is removed when its response/cancel arrives. (#128-adjacent)
+    pending_interactive_requests: HashMap<String, PendingInteractiveRequest>,
 }
 
 // ── Spawn entry point ──
@@ -303,7 +305,7 @@ pub fn spawn_actor(
         json_parse_fail_count: 0,
         ralph_loop: None,
         ralph_needs_dispatch: false,
-        pending_interactive_request: None,
+        pending_interactive_requests: HashMap::new(),
     };
 
     let join_handle = tokio::spawn(async move {
@@ -1009,10 +1011,11 @@ impl SessionActor {
                 if Instant::now() >= deadline {
                     // Quarantine secondary timeout → hard-kill
                     log::warn!(
-                        "[turn] quarantine hard-timeout: run_id={}, from_internal={}, pending_request={:?}",
+                        "[turn] quarantine hard-timeout: run_id={}, from_internal={}, pending_count={}, oldest_pending={:?}",
                         self.run_id,
                         self.quarantine_from_internal,
-                        self.pending_interactive_request.as_ref().map(|r| (&r.subtype, &r.detail, r.received_at.elapsed().as_secs()))
+                        self.pending_interactive_requests.len(),
+                        self.oldest_pending_interactive().map(|r| (&r.subtype, &r.detail, r.received_at.elapsed().as_secs()))
                     );
                     self.protocol.set_pending_slash_command(None);
                     if let Some(ref mut child) = self.child {
@@ -1020,11 +1023,19 @@ impl SessionActor {
                     }
                     let error_msg = if self.quarantine_from_internal {
                         "Auto-context hard timeout — process killed".to_string()
-                    } else if let Some(ref req) = self.pending_interactive_request {
+                    } else if let Some(req) = self.oldest_pending_interactive() {
                         let wait_secs = req.received_at.elapsed().as_secs();
+                        let pending = self.pending_interactive_requests.len();
                         format!(
-                            "Session timeout — waited {}s for {} response ({}). Process killed.",
-                            wait_secs, req.subtype, req.detail
+                            "Session timeout — waited {}s for {} response ({}{}). Process killed.",
+                            wait_secs,
+                            req.subtype,
+                            req.detail,
+                            if pending > 1 {
+                                format!(" +{} more pending", pending - 1)
+                            } else {
+                                String::new()
+                            }
                         )
                     } else {
                         "Session timeout — no output from CLI for 30 minutes. Process killed."
@@ -1106,10 +1117,11 @@ impl SessionActor {
         // but hard_deadline provides a safety net
         else if now >= turn.hard_deadline {
             log::warn!(
-                "[turn] user hard timeout: entering quarantine for run_id={} (turn_seq={}), pending_request={:?}",
+                "[turn] user hard timeout: entering quarantine for run_id={} (turn_seq={}), pending_count={}, oldest_pending={:?}",
                 self.run_id,
                 turn.turn_seq,
-                self.pending_interactive_request.as_ref().map(|r| (&r.subtype, &r.detail, r.received_at.elapsed().as_secs()))
+                self.pending_interactive_requests.len(),
+                self.oldest_pending_interactive().map(|r| (&r.subtype, &r.detail, r.received_at.elapsed().as_secs()))
             );
             self.protocol.set_pending_slash_command(None);
             self.active_turn = None;
@@ -1282,19 +1294,25 @@ impl SessionActor {
         self.write_control_response(request_id, response).await
     }
 
-    /// Clear pending interactive request if it matches the given request_id.
+    /// Remove the pending interactive request with the given request_id (if present).
     fn clear_pending_interactive_request(&mut self, request_id: &str) {
-        if let Some(ref req) = self.pending_interactive_request {
-            if req.request_id == request_id {
-                log::debug!(
-                    "[actor] clearing pending_interactive_request: subtype={}, detail={}, waited={}s",
-                    req.subtype,
-                    req.detail,
-                    req.received_at.elapsed().as_secs()
-                );
-                self.pending_interactive_request = None;
-            }
+        if let Some(req) = self.pending_interactive_requests.remove(request_id) {
+            log::debug!(
+                "[actor] cleared pending_interactive_request: req_id={}, subtype={}, detail={}, waited={}s, remaining={}",
+                request_id,
+                req.subtype,
+                req.detail,
+                req.received_at.elapsed().as_secs(),
+                self.pending_interactive_requests.len()
+            );
         }
+    }
+
+    /// Longest-waiting pending interactive request, for hard-timeout diagnostics.
+    fn oldest_pending_interactive(&self) -> Option<&PendingInteractiveRequest> {
+        self.pending_interactive_requests
+            .values()
+            .min_by_key(|r| r.received_at)
     }
 
     /// Send a control_cancel_request to CLI stdin (top-level message type).
@@ -1772,12 +1790,14 @@ impl SessionActor {
                 }
             }
             if hook_event == "PreToolUse" {
-                self.pending_interactive_request = Some(PendingInteractiveRequest {
-                    request_id: request_id.clone(),
-                    subtype: "hook_callback".to_string(),
-                    detail: format!("PreToolUse:{}", hook_label),
-                    received_at: Instant::now(),
-                });
+                self.pending_interactive_requests.insert(
+                    request_id.clone(),
+                    PendingInteractiveRequest {
+                        subtype: "hook_callback".to_string(),
+                        detail: format!("PreToolUse:{}", hook_label),
+                        received_at: Instant::now(),
+                    },
+                );
                 notify_if_background(
                     self.emitter.app(),
                     "Hook Review Required",
@@ -1850,12 +1870,14 @@ impl SessionActor {
                 url,
                 requested_schema,
             });
-            self.pending_interactive_request = Some(PendingInteractiveRequest {
-                request_id: request_id.clone(),
-                subtype: "elicitation".to_string(),
-                detail: mcp_server_name.clone(),
-                received_at: Instant::now(),
-            });
+            self.pending_interactive_requests.insert(
+                request_id.clone(),
+                PendingInteractiveRequest {
+                    subtype: "elicitation".to_string(),
+                    detail: mcp_server_name.clone(),
+                    received_at: Instant::now(),
+                },
+            );
             notify_if_background(
                 self.emitter.app(),
                 "MCP Input Required",
@@ -1918,12 +1940,14 @@ impl SessionActor {
                 parent_tool_use_id,
                 suggestions,
             });
-            self.pending_interactive_request = Some(PendingInteractiveRequest {
+            self.pending_interactive_requests.insert(
                 request_id,
-                subtype: "can_use_tool".to_string(),
-                detail: tool_label.clone(),
-                received_at: Instant::now(),
-            });
+                PendingInteractiveRequest {
+                    subtype: "can_use_tool".to_string(),
+                    detail: tool_label.clone(),
+                    received_at: Instant::now(),
+                },
+            );
             notify_if_background(
                 self.emitter.app(),
                 "Permission Required",

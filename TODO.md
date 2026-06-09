@@ -63,6 +63,13 @@
   - Verified: prettier + svelte-check (0 errors). ⚠️ Manual: confirm visually by collapsing the tool sidebar with the Files tab open.
 - **Owner:** Claude  ·  **Status:** `[x]` (fixed)
 
+### 🟠 BUG · `M` · [local] Parallel tool permissions pile up; "only last Allow works"
+- **Reported by user (2026-06-09):** leave a working session, come back to ~11 stacked "Allow" prompts + a red `[ede_diagnostic] … stop_reason=tool_use` "retry or dismiss" card. Clicking Allow seems to only take effect for the last request; the prompts reappear after switching away and back.
+- **Investigation (Claude):** Traced the full permission path — it is **per-request correct** end-to-end: `can_use_tool` → `PermissionPrompt(request_id)` → reducer matches by `tool_use_id` → per-card `respondPermission(request_id)` → `write_control_response(request_id)`. CLI-cancel → `ControlCancelled` clears the matching card; idle clears stale prompts. The `[ede_diagnostic]` text is emitted by the **Claude CLI itself**, not OpenCovibe.
+- **🩹 PARTIAL FIX 2026-06-09:** `session_actor.pending_interactive_request` was a **single `Option`** clobbered by each concurrent prompt → converted to a `HashMap<request_id, …>` so parallel prompts no longer lose each other's timeout diagnostics (`oldest_pending_interactive` + pending count in timeout/quarantine logs). This corrects diagnostics but does **not** by itself explain "only last works".
+- **Still open — needs runtime evidence.** Likely either (a) the CLI mishandling parallel permission responses, or (b) a long-idle **user-turn hard-timeout → quarantine** (`session_actor.rs:~1107`) after which incoming `can_use_tool` are auto-denied (`~2025`). To confirm: reproduce with debug logging and count `[actor] permission prompt: req_id=…` vs `[actor] write_control_response: req_id=…` — equal counts ⇒ CLI bug; fewer responses ⇒ our send path.
+- **Owner:** Claude (partial)  ·  **Status:** `[~]`
+
 ### 🟡 IMPROVEMENT · `S` · [#115] Session auto-recovery is silent
 - **Issue:** [#115](https://github.com/AnyiWang/OpenCovibe/issues/115)
 - **Problem:** Auto-recovery already works, but gives no feedback, so users needlessly click "Resume Session" first.
