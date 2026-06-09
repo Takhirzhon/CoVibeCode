@@ -167,6 +167,35 @@
     {/if}
     <!-- Label -->
     <span class="truncate">{label}</span>
+    <!-- Quick add (+) — new chat in this project without opening a dialog (#132) -->
+    {#if onNewChat}
+      <button
+        class="shrink-0 flex h-4 w-4 items-center justify-center rounded opacity-0 text-muted-foreground hover:text-sidebar-foreground hover:bg-sidebar-accent group-hover/folder:opacity-100 focus-visible:opacity-100 transition-opacity"
+        aria-label={t("sidebar_newChatInFolder")}
+        title={t("sidebar_newChatInFolder")}
+        onclick={(e) => {
+          e.stopPropagation();
+          onNewChat?.();
+        }}
+        onkeydown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.stopPropagation();
+            e.preventDefault();
+            onNewChat?.();
+          }
+        }}
+      >
+        <svg
+          class="h-3 w-3"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"><path d="M12 5v14" /><path d="M5 12h14" /></svg
+        >
+      </button>
+    {/if}
     <!-- Count badge -->
     {#if showCount && folder.conversationCount > 0}
       <span

@@ -3,7 +3,7 @@
   import { TERMINAL_PHASES, canResumeNow } from "$lib/stores";
   import { getNoSessionPersistence } from "$lib/stores/agent-settings-cache.svelte";
   import StatusBadge from "./StatusBadge.svelte";
-  import { relativeTime, truncate } from "$lib/utils/format";
+  import { relativeTime } from "$lib/utils/format";
   import { PLATFORM_PRESETS } from "$lib/utils/platform-presets";
   import { t } from "$lib/i18n/index.svelte";
   import { dbg, dbgWarn } from "$lib/utils/debug";
@@ -30,7 +30,9 @@
   } = $props();
 
   const run = $derived(conversation.latestRun);
-  const label = $derived(truncate(conversation.title, 28));
+  // Let CSS handle truncation (the title <span> has `truncate`). A hard JS char cap
+  // here caused premature ellipsis regardless of available width. (#132)
+  const label = $derived(conversation.title);
   const time = $derived(relativeTime(run.last_activity_at ?? run.started_at));
   const canResume = $derived(
     canResumeNow(run, run.status as any, getNoSessionPersistence(run.agent)),
@@ -247,7 +249,7 @@
           >
         </button>
       {/if}
-      <StatusBadge status={run.status} attention={needsAttention} class="shrink-0" />
+      <StatusBadge status={run.status} attention={needsAttention} iconOnly class="shrink-0" />
     </div>
   </div>
   <div class="mt-0.5 flex items-center gap-2 text-xs text-muted-foreground">
