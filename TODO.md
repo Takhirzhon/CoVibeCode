@@ -84,7 +84,13 @@
 ### 🟡 IMPROVEMENT · `M` · [#132] Left session-list UI optimization
 - **Issue:** [#132](https://github.com/AnyiWang/OpenCovibe/issues/132)
 - **Asks:** distinct styling for project vs. conversation titles; indent conversations; icon status indicators (running/done/stopped) instead of text; inline `+` add button next to project name; fix premature title truncation. (Codex UI as reference.)
-- **Owner:** _unassigned_  ·  **Status:** `[ ]`
+- **✅ DONE 2026-06-09 (Claude).**
+  - **Icon status:** `StatusBadge` gained an `iconOnly` prop (just the colored dot, with a `title`/`aria-label` tooltip); `ConversationItem` uses it → no more "running/done/stopped" text pills cluttering the list.
+  - **Truncation fix:** `ConversationItem` was double-truncating (JS `truncate(title, 28)` + CSS `truncate`); dropped the hard 28-char cap so CSS truncates by actual width (no premature ellipsis).
+  - **Inline `+`:** `ProjectFolderItem` header now has a hover-revealed `+` next to the project name (quick new-chat without expanding), for non-uncategorized folders.
+  - **Already present:** conversations are indented (`pl-3`); project headers are `font-medium` vs conversation `text-xs` (distinct styling). Left those as-is.
+  - Verified: svelte-check (0 err), eslint, prettier. ⚠️ Manual: eyeball the sidebar (status dots, long titles, hover `+`).
+- **Owner:** Claude  ·  **Status:** `[x]` (done)
 
 ### 🟢 NEW FEATURE · `S–M` · [#123] Sound notification on task completion
 - **Issue:** [#123](https://github.com/AnyiWang/OpenCovibe/issues/123)
