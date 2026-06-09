@@ -56,6 +56,13 @@
   - Related closed issue: upstream #135 (top-bar token/turn counter).
 - **Owner:** Claude  ·  **Status:** `[x]` (fixed + tested)
 
+### 🟠 BUG · `S` · [#163] Tool sidebar text overflows when collapsed
+- **Issue:** [#163](https://github.com/AnyiWang/OpenCovibe/issues/163) (filed against upstream v0.2.1, macOS — but a CSS bug, so cross-platform).
+- **✅ FIXED 2026-06-09 (Claude).** Root cause: `ToolActivity.svelte` keeps tabs mounted and toggles each with `visibility: visible/hidden` (lazy keep-alive). When the panel collapses it sets the wrapper to `visibility: hidden`, but the **active tab re-asserts `visibility: visible`**, and per CSS a descendant's `visibility:visible` overrides an ancestor's `hidden` — so the active tab's text paints inside the 32px collapsed rail.
+  - Fix: also set `opacity: 0` on the collapsed wrapper. Opacity on an ancestor **cannot** be overridden by descendants, and (unlike `display:none`) preserves CodeMirror's layout so the panel can stay mounted. One-line style change in `src/lib/components/ToolActivity.svelte`.
+  - Verified: prettier + svelte-check (0 errors). ⚠️ Manual: confirm visually by collapsing the tool sidebar with the Files tab open.
+- **Owner:** Claude  ·  **Status:** `[x]` (fixed)
+
 ### 🟡 IMPROVEMENT · `S` · [#115] Session auto-recovery is silent
 - **Issue:** [#115](https://github.com/AnyiWang/OpenCovibe/issues/115)
 - **Problem:** Auto-recovery already works, but gives no feedback, so users needlessly click "Resume Session" first.

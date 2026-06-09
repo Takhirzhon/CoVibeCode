@@ -586,12 +586,19 @@
   class="relative h-full border-l border-border bg-muted/30 overflow-hidden"
   style="width: {collapsed ? '32px' : effectiveWidth + 'px'}; contain: layout style;"
 >
-  <!-- Always-mounted expanded panel (visibility-hidden when collapsed) -->
+  <!-- Always-mounted expanded panel (hidden when collapsed). Use opacity:0 in addition
+       to visibility:hidden: each tab re-asserts visibility:visible for keep-alive, and a
+       child's visibility:visible overrides an ancestor's visibility:hidden — so without
+       opacity the active tab's text bleeds into the 32px collapsed rail (#163). opacity on
+       an ancestor cannot be overridden by descendants, and (unlike display:none) preserves
+       CodeMirror's layout so the panel can stay mounted. -->
   <div
     class="absolute top-0 left-0 h-full flex flex-col"
     style="width: {effectiveWidth}px; visibility: {collapsed
       ? 'hidden'
-      : 'visible'}; pointer-events: {collapsed ? 'none' : 'auto'};"
+      : 'visible'}; opacity: {collapsed ? '0' : '1'}; pointer-events: {collapsed
+      ? 'none'
+      : 'auto'};"
     aria-hidden={collapsed}
   >
     <!-- Resize handle on the left edge -->
