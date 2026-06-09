@@ -113,6 +113,12 @@ export async function softDeleteRuns(ids: string[]): Promise<number> {
   return invoke<number>("soft_delete_runs", { ids });
 }
 
+/** Archive or unarchive runs by id. Returns the count of runs that changed state. (#128) */
+export async function setRunsArchived(ids: string[], archived: boolean): Promise<number> {
+  dbg("api", "setRunsArchived", { ids, archived });
+  return invoke<number>("set_runs_archived", { ids, archived });
+}
+
 // Prompt search & favorites
 
 export async function searchPrompts(query: string, limit?: number): Promise<PromptSearchResult[]> {

@@ -150,6 +150,7 @@ pub fn run() {
             commands::runs::update_run_model,
             commands::runs::rename_run,
             commands::runs::soft_delete_runs,
+            commands::runs::set_runs_archived,
             commands::runs::search_prompts,
             commands::history::search_runs,
             commands::history::get_run_files,

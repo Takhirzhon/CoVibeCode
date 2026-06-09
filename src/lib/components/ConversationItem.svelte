@@ -19,12 +19,14 @@
     onclick,
     onresume,
     ondelete,
+    onarchive,
   }: {
     conversation: ConversationGroup;
     selected?: boolean;
     onclick?: () => void;
     onresume?: (runId: string, mode: "resume") => void;
     ondelete?: (conversation: ConversationGroup) => void;
+    onarchive?: (conversation: ConversationGroup, archived: boolean) => void;
   } = $props();
 
   const run = $derived(conversation.latestRun);
@@ -174,6 +176,52 @@
               d="M21 3v5h-5"
             /></svg
           >
+        </button>
+      {/if}
+      {#if onarchive}
+        <button
+          class="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-accent text-muted-foreground hover:text-foreground transition-opacity"
+          onclick={(e) => {
+            e.stopPropagation();
+            onarchive(conversation, !conversation.isArchived);
+          }}
+          title={conversation.isArchived ? t("sidebar_unarchive") : t("sidebar_archive")}
+        >
+          {#if conversation.isArchived}
+            <!-- Unarchive (restore) -->
+            <svg
+              class="h-3.5 w-3.5"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              ><polyline points="3 8 3 21 21 21 21 8" /><rect
+                x="1"
+                y="3"
+                width="22"
+                height="5"
+              /><line x1="12" y1="17" x2="12" y2="11" /><polyline points="9 14 12 11 15 14" /></svg
+            >
+          {:else}
+            <!-- Archive -->
+            <svg
+              class="h-3.5 w-3.5"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              ><polyline points="21 8 21 21 3 21 3 8" /><rect
+                x="1"
+                y="3"
+                width="22"
+                height="5"
+              /><line x1="10" y1="12" x2="14" y2="12" /></svg
+            >
+          {/if}
         </button>
       {/if}
       {#if canDelete && ondelete}

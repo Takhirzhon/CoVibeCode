@@ -1288,6 +1288,7 @@ pub fn import_session(
         cli_session_path: Some(cli_path.to_string_lossy().to_string()),
         cli_usage_incomplete: None, // Set after import
         deleted_at: None,
+        archived_at: None,
         no_session_persistence: false, // CLI import = normal persistent session
         execution_path: Some(crate::models::ExecutionPath::SessionActor), // CLI import = Claude session
         conversation_ref: Some(crate::models::ConversationRef::ClaudeSession(

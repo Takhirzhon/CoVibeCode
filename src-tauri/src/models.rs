@@ -188,6 +188,9 @@ pub struct TaskRun {
     /// Resolved conversation identity (None = not resumable).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_ref: Option<ConversationRef>,
+    /// True when the run is archived (hidden from the main list). (#128)
+    #[serde(default)]
+    pub archived: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -513,6 +516,10 @@ pub struct RunMeta {
     /// Soft-delete timestamp (ISO 8601). When set, run is hidden from all read paths.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deleted_at: Option<String>,
+    /// Archive timestamp (ISO 8601). When set, run is hidden from the main conversation
+    /// list but still listed (under the Archived section) and fully resumable. (#128)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<String>,
     /// Snapshot of no_session_persistence at run creation time (metadata only — runtime
     /// resume gate uses current agent settings, not this snapshot).
     #[serde(default)]
@@ -584,6 +591,7 @@ impl RunMeta {
             no_session_persistence: self.no_session_persistence,
             execution_path: self.resolved_execution_path(),
             conversation_ref: self.resolved_conversation_ref(),
+            archived: self.archived_at.is_some(),
         }
     }
 }

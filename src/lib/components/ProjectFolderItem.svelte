@@ -22,6 +22,7 @@
     onSelectConversation: (runId: string) => void;
     onResume: (runId: string, mode: "resume") => void;
     onDelete?: (conversation: ConversationGroup) => void;
+    onArchive?: (conversation: ConversationGroup, archived: boolean) => void;
     onNewChat?: () => void;
   };
 
@@ -31,6 +32,7 @@
     onSelectConversation?: never;
     onResume?: never;
     onDelete?: never;
+    onArchive?: never;
     onNewChat?: never;
   };
 
@@ -46,6 +48,7 @@
     onSelectConversation,
     onResume,
     onDelete,
+    onArchive,
     onNewChat,
   }: ChatProps | CustomProps = $props();
 
@@ -237,6 +240,7 @@
             onclick={() => onSelectConversation?.(conv.latestRun.id)}
             onresume={onResume}
             ondelete={onDelete}
+            onarchive={onArchive}
           />
         {/each}
         {#if hasMore}

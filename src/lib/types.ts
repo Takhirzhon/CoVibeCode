@@ -61,6 +61,8 @@ export interface TaskRun {
   execution_path: ExecutionPath;
   /** Unified resume identity. Undefined = not resumable. */
   conversation_ref?: ConversationRef;
+  /** True when the run is archived (hidden from the main conversation list). (#128) */
+  archived?: boolean;
 }
 
 export interface ImportWatermark {

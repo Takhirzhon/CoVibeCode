@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import type { TaskRun } from "$lib/types";
 import {
   buildProjectFolders,
+  buildArchivedConversations,
   autoExpandForRun,
   expandForProjectChange,
   normalizeCwd,
@@ -25,6 +26,31 @@ function makeRun(overrides: Partial<TaskRun> = {}): TaskRun {
 
 const NO_FAVS = new Set<string>();
 const NO_PINS: string[] = [];
+
+// ── Archive (#128) ──
+
+describe("archive partitioning", () => {
+  it("excludes archived runs from the project folder tree", () => {
+    const runs = [
+      makeRun({ id: "a", session_id: "s1", cwd: "/p" }),
+      makeRun({ id: "b", session_id: "s2", cwd: "/p", archived: true }),
+    ];
+    const folders = buildProjectFolders(runs, NO_FAVS, NO_PINS);
+    const allConvs = folders.flatMap((f) => f.conversations);
+    expect(allConvs.map((c) => c.groupKey)).toEqual(["s:s1"]);
+  });
+
+  it("buildArchivedConversations returns only archived, flagged isArchived", () => {
+    const runs = [
+      makeRun({ id: "a", session_id: "s1" }),
+      makeRun({ id: "b", session_id: "s2", archived: true }),
+    ];
+    const archived = buildArchivedConversations(runs, NO_FAVS);
+    expect(archived).toHaveLength(1);
+    expect(archived[0].groupKey).toBe("s:s2");
+    expect(archived[0].isArchived).toBe(true);
+  });
+});
 
 // ── normalizeCwd ──
 
