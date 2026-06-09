@@ -11,8 +11,10 @@
     searchPrompts,
     listMemoryFiles,
     softDeleteRuns,
+    setRunsArchived,
   } from "$lib/api";
   import ProjectFolderItem from "$lib/components/ProjectFolderItem.svelte";
+  import ConversationItem from "$lib/components/ConversationItem.svelte";
   import CommandPalette from "$lib/components/CommandPalette.svelte";
   import SetupWizard from "$lib/components/SetupWizard.svelte";
   import AboutModal from "$lib/components/AboutModal.svelte";
@@ -34,6 +36,7 @@
   import { filterVisibleCandidates } from "$lib/utils/memory-helpers";
   import {
     buildProjectFolders,
+    buildArchivedConversations,
     autoExpandForRun,
     expandForProjectChange,
     normalizeCwd,
@@ -981,6 +984,21 @@
   let projectFolders = $derived.by(() =>
     buildProjectFolders(runs, favoriteRunIds, pinnedCwds, removedCwds),
   );
+
+  // Archived conversations (flat list, shown under a collapsible section) (#128)
+  let archivedConversations = $derived.by(() => buildArchivedConversations(runs, favoriteRunIds));
+  let archivedExpanded = $state(false);
+
+  async function archiveConversation(conv: ConversationGroup, archived: boolean) {
+    try {
+      const ids = conv.runs.map((r) => r.id);
+      await setRunsArchived(ids, archived);
+      dbg("layout", "archiveConversation", { ids, archived });
+      window.dispatchEvent(new Event("ocv:runs-changed"));
+    } catch (e) {
+      dbgWarn("layout", "archiveConversation failed", e);
+    }
+  }
 
   // Selectable folders: real project folders (exclude Uncategorized)
   const selectableFolders = $derived(projectFolders.filter((f) => !f.isUncategorized));
@@ -2192,6 +2210,7 @@
                     onSelectConversation={(runId) => goto(`/chat?run=${runId}`)}
                     onResume={(runId, mode) => goto(`/chat?run=${runId}&resume=${mode}`)}
                     onDelete={requestDeleteConversation}
+                    onArchive={archiveConversation}
                     onRemove={folder.isUncategorized
                       ? undefined
                       : () => requestRemoveProject(folder.cwd)}
@@ -2217,7 +2236,63 @@
                   <span>{t("project_openFolder")}</span>
                 </button>
 
-                {#if projectFolders.length === 0}
+                <!-- Archived conversations (collapsible) (#128) -->
+                {#if archivedConversations.length > 0}
+                  <div class="mt-1 border-t border-sidebar-border/50 pt-1">
+                    <button
+                      class="flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-xs text-muted-foreground hover:text-sidebar-foreground hover:bg-sidebar-accent/50 transition-colors"
+                      onclick={() => (archivedExpanded = !archivedExpanded)}
+                    >
+                      <svg
+                        class="h-3 w-3 shrink-0 transition-transform {archivedExpanded
+                          ? 'rotate-90'
+                          : ''}"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"><polyline points="9 18 15 12 9 6" /></svg
+                      >
+                      <svg
+                        class="h-3.5 w-3.5 shrink-0"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        ><polyline points="21 8 21 21 3 21 3 8" /><rect
+                          x="1"
+                          y="3"
+                          width="22"
+                          height="5"
+                        /><line x1="10" y1="12" x2="14" y2="12" /></svg
+                      >
+                      <span class="truncate"
+                        >{t("sidebar_archived", {
+                          count: String(archivedConversations.length),
+                        })}</span
+                      >
+                    </button>
+                    {#if archivedExpanded}
+                      <div class="mt-0.5 space-y-0.5">
+                        {#each archivedConversations as conv (conv.groupKey)}
+                          <ConversationItem
+                            conversation={conv}
+                            selected={conv.runs.some((r) => r.id === selectedRunId)}
+                            onclick={() => goto(`/chat?run=${conv.latestRun.id}`)}
+                            onresume={(runId, mode) => goto(`/chat?run=${runId}&resume=${mode}`)}
+                            ondelete={requestDeleteConversation}
+                            onarchive={archiveConversation}
+                          />
+                        {/each}
+                      </div>
+                    {/if}
+                  </div>
+                {/if}
+
+                {#if projectFolders.length === 0 && archivedConversations.length === 0}
                   <div class="flex flex-col items-center gap-2 px-3 py-6 text-center">
                     <p class="text-xs text-muted-foreground">
                       {t("sidebar_noConversationsYet")}<br />{t("sidebar_startNewChat")}

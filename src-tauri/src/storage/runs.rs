@@ -109,6 +109,7 @@ pub fn create_run(
         cli_session_path: None,
         cli_usage_incomplete: None,
         deleted_at: None,
+        archived_at: None,
         no_session_persistence,
         execution_path: None,   // Caller sets after create_run
         conversation_ref: None, // Written by runtime events (session_init / thread.started)
@@ -531,5 +532,50 @@ pub fn soft_delete_runs(ids: &[String]) -> Result<u32, String> {
     }
 
     log::debug!("[storage/runs] soft_delete_runs: deleted {} runs", count);
+    Ok(count)
+}
+
+/// Archive (or unarchive) runs by id: set/clear `archived_at`. Returns the count
+/// of runs whose state actually changed. Unlike delete, archiving an active run is
+/// allowed (it stays resumable). Best-effort rollback on failure. (#128)
+pub fn set_runs_archived(ids: &[String], archived: bool) -> Result<u32, String> {
+    let unique_ids: Vec<&String> = {
+        let mut seen = std::collections::HashSet::new();
+        ids.iter().filter(|id| seen.insert(id.as_str())).collect()
+    };
+
+    // Phase 1: read metas, skip no-ops (already in the desired state)
+    let mut metas: Vec<RunMeta> = Vec::with_capacity(unique_ids.len());
+    for id in &unique_ids {
+        let meta = get_run_raw(id).ok_or_else(|| format!("Run {} not found", id))?;
+        if meta.archived_at.is_some() == archived {
+            continue; // already in target state
+        }
+        metas.push(meta);
+    }
+
+    // Phase 2: write archived_at; rollback on failure
+    let now = now_iso();
+    let originals: Vec<RunMeta> = metas.clone();
+    let mut count = 0u32;
+    for meta in &mut metas {
+        meta.archived_at = if archived { Some(now.clone()) } else { None };
+        if let Err(e) = save_meta(meta) {
+            for orig in &originals[..=count as usize] {
+                let _ = save_meta(orig);
+            }
+            return Err(format!(
+                "Failed to set archived on run {}: {}. Rollback attempted.",
+                meta.id, e
+            ));
+        }
+        count += 1;
+    }
+
+    log::debug!(
+        "[storage/runs] set_runs_archived: {} runs → archived={}",
+        count,
+        archived
+    );
     Ok(count)
 }

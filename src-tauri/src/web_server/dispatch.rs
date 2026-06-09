@@ -74,6 +74,18 @@ pub async fn dispatch_command(
             let count = crate::commands::runs::soft_delete_runs(ids)?;
             Ok(json!(count))
         }
+        "set_runs_archived" => {
+            let ids: Vec<String> = params
+                .get("ids")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            let archived = params
+                .get("archived")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let count = crate::commands::runs::set_runs_archived(ids, archived)?;
+            Ok(json!(count))
+        }
         "update_run_model" => {
             let id = extract_str(&params, "id")?;
             let model = extract_str(&params, "model")?;

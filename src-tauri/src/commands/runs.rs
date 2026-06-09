@@ -165,6 +165,16 @@ pub fn soft_delete_runs(ids: Vec<String>) -> Result<u32, String> {
 }
 
 #[tauri::command]
+pub fn set_runs_archived(ids: Vec<String>, archived: bool) -> Result<u32, String> {
+    log::debug!(
+        "[cmd/runs] set_runs_archived: ids={:?}, archived={}",
+        ids,
+        archived
+    );
+    storage::runs::set_runs_archived(&ids, archived)
+}
+
+#[tauri::command]
 pub fn update_run_model(id: String, model: String) -> Result<(), String> {
     log::debug!("[runs] update_run_model: id={}, model={}", id, model);
     storage::runs::update_run_model(&id, &model)

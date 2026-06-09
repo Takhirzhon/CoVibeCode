@@ -89,7 +89,12 @@
 ### 🟢 NEW FEATURE · `M` · [#128] Delete / archive conversations
 - **Issue:** [#128](https://github.com/AnyiWang/OpenCovibe/issues/128)
 - **Ask:** Let users delete or archive specific sessions (none currently possible). Needs UI action + backend storage handling for session removal/archival.
-- **Owner:** _unassigned_  ·  **Status:** `[ ]`
+- **✅ DONE 2026-06-09 (Claude).** Delete already existed (soft-delete via `deleted_at`); this added **Archive**:
+  - Backend: `archived_at` on `RunMeta` + `archived` on `TaskRun`; `set_runs_archived` storage fn + tauri command (registered in `lib.rs` + `web_server/dispatch.rs`), mirroring `soft_delete_runs`. Archiving an active run is allowed (stays resumable); reversible.
+  - Frontend: `setRunsArchived` API; `buildProjectFolders` excludes archived; new `buildArchivedConversations` + a collapsible **"Archived (N)"** section in the sidebar; Archive/Unarchive hover action in `ConversationItem` (threaded via `ProjectFolderItem`). en + zh-CN i18n.
+  - Verified: svelte-check (0 err), sidebar-groups 38 tests (2 new), backend `runs` tests, eslint/prettier/rustfmt/i18n clean.
+  - ⚠️ Manual: confirm in-app — hover a conversation → Archive → it moves to the Archived section → Unarchive restores it.
+- **Owner:** Claude  ·  **Status:** `[x]` (done)
 
 ### 🟢 NEW FEATURE · `M` · [PR #127] Enhanced paste (plain-text shortcut + block actions)
 - **PR:** [#127](https://github.com/AnyiWang/OpenCovibe/pull/127) — open upstream, **could be cherry-picked**.
