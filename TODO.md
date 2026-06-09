@@ -74,7 +74,12 @@
 - **Issue:** [#115](https://github.com/AnyiWang/OpenCovibe/issues/115)
 - **Problem:** Auto-recovery already works, but gives no feedback, so users needlessly click "Resume Session" first.
 - **Fix direction (pick some/all):** (A) show a transient "Restoring session…" indicator; (B) change input placeholder to "Send message to continue this session" when inactive; (C) hide the manual "Resume Session" context-menu item.
-- **Owner:** _unassigned_  ·  **Status:** `[ ]`
+- **✅ DONE 2026-06-09 (Claude).** Implemented A + B:
+  - **(B)** `PromptInput.effectivePlaceholder`: when `canResume && !sessionAlive && !running`, the composer shows "Send a message to continue this session…" so users know they can just type (the props were already passed from the chat page).
+  - **(A)** chat `+page.svelte` auto-resume path now fires a transient "Restoring session…" toast (`promptRef.showToast`).
+  - en + zh-CN strings. **(C) skipped** — left the manual Resume option in place (non-destructive); A+B remove the confusion.
+  - Verified: svelte-check (0 err), prettier, i18n (0 err).
+- **Owner:** Claude  ·  **Status:** `[x]` (done)
 
 ### 🟡 IMPROVEMENT · `M` · [#132] Left session-list UI optimization
 - **Issue:** [#132](https://github.com/AnyiWang/OpenCovibe/issues/132)

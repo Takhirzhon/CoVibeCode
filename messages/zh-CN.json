@@ -394,6 +394,8 @@
   "prompt_dropFiles": "将文件拖放到此处",
   "prompt_hasRunPlaceholder": "发送消息...",
   "prompt_newPlaceholder": "输入消息以开始...",
+  "prompt_continueSessionPlaceholder": "发送消息以继续此会话...",
+  "chat_restoringSession": "正在恢复会话…",
   "prompt_removePaste": "移除粘贴的文本",
   "prompt_permissionModeTitle": "权限模式：{mode}",
   "prompt_attachFiles": "附加文件",
