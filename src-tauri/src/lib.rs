@@ -67,16 +67,60 @@ impl ShutdownGate {
     }
 }
 
-pub fn run() {
-    // Initialize logging — our crate at debug level by default
-    // Override with RUST_LOG env var, e.g. RUST_LOG=warn cargo tauri dev
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("opencovibe_desktop_lib=debug,warn"),
-    )
-    .format_timestamp_millis()
-    .init();
+/// Log sink that mirrors every formatted log line to BOTH stderr and a file.
+/// Lets us persist a full session (CLI stream-json, permission flow, etc.) to
+/// `~/.opencovibe/logs.txt` so users can attach it to bug reports.
+struct LogTee {
+    file: std::fs::File,
+}
 
-    log::info!("OpenCovibe Desktop starting");
+impl std::io::Write for LogTee {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Best-effort mirror to the console; the file write is authoritative.
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), buf);
+        self.file.write_all(buf)?;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        self.file.flush()
+    }
+}
+
+pub fn run() {
+    // Initialize logging — our crate at debug level by default.
+    // Override with RUST_LOG env var, e.g. RUST_LOG=warn cargo tauri dev.
+    // Logs are also appended to ~/.opencovibe/logs.txt (each launch starts a new
+    // session, marked by the "OpenCovibe Desktop starting" line below) so a full
+    // session can be captured for bug reports.
+    let log_path = crate::storage::data_dir().join("logs.txt");
+    let _ = crate::storage::ensure_dir(&crate::storage::data_dir());
+    let mut builder = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("opencovibe_desktop_lib=debug,warn"),
+    );
+    builder.format_timestamp_millis();
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        Ok(file) => {
+            builder.target(env_logger::Target::Pipe(Box::new(LogTee { file })));
+        }
+        Err(e) => {
+            eprintln!(
+                "[log] could not open {} ({}); logging to stderr only",
+                log_path.display(),
+                e
+            );
+        }
+    }
+    builder.init();
+
+    log::info!(
+        "OpenCovibe Desktop starting (logs → {})",
+        log_path.display()
+    );
 
     // Set up Windows Job Object so child processes are killed on crash/force-quit.
     // No-op on non-Windows.
