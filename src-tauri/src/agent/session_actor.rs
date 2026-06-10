@@ -1116,19 +1116,34 @@ impl SessionActor {
         // User turns: typically don't time out (CLI manages its own flow)
         // but hard_deadline provides a safety net
         else if now >= turn.hard_deadline {
-            log::warn!(
-                "[turn] user hard timeout: entering quarantine for run_id={} (turn_seq={}), pending_count={}, oldest_pending={:?}",
-                self.run_id,
-                turn.turn_seq,
-                self.pending_interactive_requests.len(),
-                self.oldest_pending_interactive().map(|r| (&r.subtype, &r.detail, r.received_at.elapsed().as_secs()))
-            );
-            self.protocol.set_pending_slash_command(None);
-            self.active_turn = None;
-            self.quarantine_until_result = true;
-            self.interrupt_sent_for_quarantine = false;
-            self.quarantine_deadline = None;
-            self.quarantine_from_internal = false;
+            if self.pending_interactive_requests.is_empty() {
+                log::warn!(
+                    "[turn] user hard timeout: entering quarantine for run_id={} (turn_seq={})",
+                    self.run_id,
+                    turn.turn_seq,
+                );
+                self.protocol.set_pending_slash_command(None);
+                self.active_turn = None;
+                self.quarantine_until_result = true;
+                self.interrupt_sent_for_quarantine = false;
+                self.quarantine_deadline = None;
+                self.quarantine_from_internal = false;
+            } else {
+                // The turn is WAITING ON THE USER (AskUserQuestion / can_use_tool /
+                // elicitation), not a hung CLI. Quarantining here would cancel the
+                // prompt — and the user's eventual answer would target a dead
+                // request_id (stuck answer + re-ask, the [ede_diagnostic] case).
+                // Defer the deadline instead so a slow human answer is never killed.
+                let pending = self.pending_interactive_requests.len();
+                if let Some(t) = self.active_turn.as_mut() {
+                    t.hard_deadline = now + USER_HARD_TIMEOUT;
+                }
+                log::debug!(
+                    "[turn] hard_deadline reached with {} interactive request(s) pending — deferring (waiting on user), run_id={}",
+                    pending,
+                    self.run_id
+                );
+            }
         }
     }
 
