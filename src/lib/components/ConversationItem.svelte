@@ -105,7 +105,7 @@
   onkeydown={handleKeydown}
 >
   <div class="flex items-center justify-between gap-2">
-    <div class="flex items-center gap-1.5 min-w-0">
+    <div class="flex items-center gap-1.5 min-w-0 flex-1">
       {#if conversation.isFavorite}
         <svg
           class="h-3 w-3 shrink-0 text-yellow-500"
@@ -249,7 +249,7 @@
           >
         </button>
       {/if}
-      <StatusBadge status={run.status} attention={needsAttention} iconOnly class="shrink-0" />
+      <StatusBadge status={run.status} attention={needsAttention} class="shrink-0" />
     </div>
   </div>
   <div class="mt-0.5 flex items-center gap-2 text-xs text-muted-foreground">

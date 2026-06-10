@@ -6,14 +6,10 @@
   let {
     status,
     attention = false,
-    iconOnly = false,
     class: className = "",
   }: {
     status: RunStatus;
     attention?: boolean;
-    /** Render just the colored status dot (no text label). Used in the dense
-     *  sidebar conversation list to reduce clutter. (#132) */
-    iconOnly?: boolean;
     class?: string;
   } = $props();
 
@@ -46,19 +42,11 @@
   };
 </script>
 
-{#if iconOnly}
-  <span
-    class="inline-flex h-2 w-2 shrink-0 rounded-full {dots[displayStatus]} {className}"
-    title={displayStatus}
-    aria-label={displayStatus}
-  ></span>
-{:else}
-  <span
-    class="inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-xs font-medium {colors[
-      displayStatus
-    ]} {className}"
-  >
-    <span class="h-1.5 w-1.5 rounded-full {dots[displayStatus]}"></span>
-    {displayStatus}
-  </span>
-{/if}
+<span
+  class="inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-xs font-medium {colors[
+    displayStatus
+  ]} {className}"
+>
+  <span class="h-1.5 w-1.5 rounded-full {dots[displayStatus]}"></span>
+  {displayStatus}
+</span>

@@ -67,8 +67,17 @@
 - **Reported by user (2026-06-09):** leave a working session, come back to ~11 stacked "Allow" prompts + a red `[ede_diagnostic] … stop_reason=tool_use` "retry or dismiss" card. Clicking Allow seems to only take effect for the last request; the prompts reappear after switching away and back.
 - **Investigation (Claude):** Traced the full permission path — it is **per-request correct** end-to-end: `can_use_tool` → `PermissionPrompt(request_id)` → reducer matches by `tool_use_id` → per-card `respondPermission(request_id)` → `write_control_response(request_id)`. CLI-cancel → `ControlCancelled` clears the matching card; idle clears stale prompts. The `[ede_diagnostic]` text is emitted by the **Claude CLI itself**, not OpenCovibe.
 - **🩹 PARTIAL FIX 2026-06-09:** `session_actor.pending_interactive_request` was a **single `Option`** clobbered by each concurrent prompt → converted to a `HashMap<request_id, …>` so parallel prompts no longer lose each other's timeout diagnostics (`oldest_pending_interactive` + pending count in timeout/quarantine logs). This corrects diagnostics but does **not** by itself explain "only last works".
-- **Still open — needs runtime evidence.** Likely either (a) the CLI mishandling parallel permission responses, or (b) a long-idle **user-turn hard-timeout → quarantine** (`session_actor.rs:~1107`) after which incoming `can_use_tool` are auto-denied (`~2025`). To confirm: reproduce with debug logging and count `[actor] permission prompt: req_id=…` vs `[actor] write_control_response: req_id=…` — equal counts ⇒ CLI bug; fewer responses ⇒ our send path.
+- **Still open — needs runtime evidence.** Likely either (a) the CLI mishandling parallel permission responses, or (b) a long-idle **user-turn hard-timeout → quarantine** (`session_actor.rs:~1107`) after which incoming `can_use_tool` are auto-denied (`~2025`). To confirm: reproduce and count `[actor] permission prompt: req_id=…` vs `[actor] write_control_response: req_id=…` — equal counts ⇒ CLI bug; fewer responses ⇒ our send path.
+- **📓 Capture enabled 2026-06-09:** all backend logs now also stream to **`~/.opencovibe/logs.txt`** (env_logger tee'd in `lib.rs`). To diagnose: reproduce the pile-up, then grep that file for `permission prompt` / `write_control_response` / the `result` event carrying `stop_reason=tool_use`, and attach it.
 - **Owner:** Claude (partial)  ·  **Status:** `[~]`
+
+### 🟠 BUG · `S` · [local] Post-update regressions in the conversation list
+- **Reported by user (2026-06-09):** after the #132 sidebar polish — the **delete button disappeared**, the **"waiting" status stopped showing**, and the colored status **dot was preferred as text**.
+- **✅ FIXED 2026-06-09 (Claude):**
+  - Reverted the icon-only `StatusBadge` → text pill is back (running/done/**waiting**/stopped), so "waiting" shows again. Removed the now-unused `iconOnly` prop.
+  - **Delete button:** root cause was the #132 truncation change — dropping the hard `truncate(title, 28)` exposed a latent layout bug (the title container had `min-w-0` but no `flex-1`, and the span wasn't width-constrained), so long titles overflowed and pushed the action buttons off-screen. Fix: `flex-1` on the title container so it shrinks/truncates and the actions (incl. delete) stay visible.
+  - Verified: svelte-check (0 err), eslint, prettier.
+- **Owner:** Claude  ·  **Status:** `[x]`
 
 ### 🟡 IMPROVEMENT · `S` · [#115] Session auto-recovery is silent
 - **Issue:** [#115](https://github.com/AnyiWang/OpenCovibe/issues/115)
