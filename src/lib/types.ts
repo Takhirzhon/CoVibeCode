@@ -156,6 +156,8 @@ export interface UserSettings {
   task_completion_sound_enabled?: boolean;
   /** Completion sound style: "chime" | "ping" | "beep". */
   task_completion_sound?: string;
+  /** Custom path/program to launch the Claude CLI (default: auto-detect). (#155) */
+  claude_path?: string;
   updated_at: string;
 }
 
