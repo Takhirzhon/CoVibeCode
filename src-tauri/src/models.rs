@@ -270,6 +270,11 @@ pub struct UserSettings {
     /// Completion sound style: "chime" | "ping" | "beep".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_completion_sound: Option<String>,
+    /// Custom path/program to launch the Claude CLI, instead of auto-detecting `claude`.
+    /// Lets users point at a non-standard install or a transparent wrapper (e.g. a
+    /// claude-tap script). Empty/None = auto-detect. (#155)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_path: Option<String>,
     pub updated_at: String,
 }
 
@@ -360,6 +365,7 @@ impl Default for UserSettings {
             web_server_tunnel_url: None,
             task_completion_sound_enabled: None,
             task_completion_sound: None,
+            claude_path: None,
             updated_at: now_iso(),
         }
     }

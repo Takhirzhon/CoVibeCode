@@ -688,6 +688,14 @@ pub fn update_user_settings(patch: serde_json::Value) -> Result<UserSettings, St
         all.user.task_completion_sound =
             v.as_str().filter(|s| !s.is_empty()).map(|s| s.to_string());
     }
+    if let Some(v) = patch.get("claude_path") {
+        all.user.claude_path = v
+            .as_str()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        // The resolved-path cache must re-evaluate the override on the next spawn. (#155)
+        crate::agent::claude_stream::invalidate_claude_path_cache();
+    }
     all.user.updated_at = crate::models::now_iso();
     save(&all)?;
     Ok(all.user)

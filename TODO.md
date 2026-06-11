@@ -115,6 +115,15 @@
   - ⚠️ Manual check: confirm audibility in the running app (audio output can't be unit-tested).
 - **Owner:** Claude  ·  **Status:** `[x]` (done)
 
+### 🟢 NEW FEATURE · `S–M` · [#155] Custom Claude CLI startup command/path
+- **Issue:** [#155](https://github.com/AnyiWang/OpenCovibe/issues/155) — let users point at a non-standard `claude` install or a wrapper (e.g. `claude-tap`) for request tracing/proxying.
+- **✅ DONE 2026-06-10 (Claude).** Added a `claude_path` user setting (custom path/program) honored by `resolve_claude_path()`, so it flows to **every** claude launch (sessions, pipe-exec, version check, plugins, MCP) uniformly.
+  - Backend: `UserSettings.claude_path` (`models.rs`); merged in `update_user_settings` which invalidates the resolved-path cache; `resolve_claude_path()` returns the override first; `build_agent_command` (pipe-exec) uses it instead of hardcoded `"claude"`.
+  - Frontend: `claude_path` type; new **"Launch"** card in Settings → CLI Config with a path/command input (en + zh-CN).
+  - **Scope note:** path/transparent-wrapper only. Prefix-wrappers that need a separator (`claude-tap --`) won't work as a raw command because the same binary is also used for `--version`/`plugin list`/MCP — the UI help directs users to a small forwarding wrapper script (which the issue lists as acceptable). Full session-only prefix support could be a follow-up.
+  - Verified: build, svelte-check (0 err), eslint, i18n (0 err), 22 settings tests.
+- **Owner:** Claude  ·  **Status:** `[x]` (done)
+
 ### 🟢 NEW FEATURE · `M` · [#128] Delete / archive conversations
 - **Issue:** [#128](https://github.com/AnyiWang/OpenCovibe/issues/128)
 - **Ask:** Let users delete or archive specific sessions (none currently possible). Needs UI action + backend storage handling for session removal/archival.
