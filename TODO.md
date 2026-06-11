@@ -144,13 +144,14 @@
 - **Issue:** [#117](https://github.com/AnyiWang/OpenCovibe/issues/117)
 - **Today:** SSH only tests the connection.
 - **Ask:** Read remote Claude Code conversations and create/manage new conversations over SSH.
-- **Owner:** _unassigned_  ·  **Status:** `[ ]`
+- **🚫 OUT OF SCOPE for this fork (team decision 2026-06-10).** Not needed.
+- **Owner:** —  ·  **Status:** `[✗]` (won't do)
 
 ### 🔵 HUGE IMPROVEMENT · `XL` · [#134] Web-server mode for mobile remote control
 - **Issue:** [#134](https://github.com/AnyiWang/OpenCovibe/issues/134)
 - **Ask:** Optional local web server (configurable port) serving the UI; responsive/touch mobile layout; password auth + stable links for LAN/intranet access.
-- **Use cases:** monitor long sessions & cost from phone, approve permission prompts, send messages remotely.
-- **Owner:** _unassigned_  ·  **Status:** `[ ]`
+- **🚫 OUT OF SCOPE for this fork (team decision 2026-06-10).** Not needed.
+- **Owner:** —  ·  **Status:** `[✗]` (won't do)
 
 ---
 
@@ -178,13 +179,15 @@
 ### 🟠 BUG · `?` · [#119] Mac client freezes when switching conversations
 - **Issue:** [#119](https://github.com/AnyiWang/OpenCovibe/issues/119)
 - **Symptom:** App suddenly becomes unresponsive while switching conversations; requires force-quit. No logs/repro upstream.
-- **Owner:** _unassigned_  ·  **Status:** `[ ]`
+- **🚫 OUT OF SCOPE for this fork (team decision 2026-06-10) — Windows team, macOS not targeted.**
+- **Owner:** —  ·  **Status:** `[✗]` (won't do)
 
 ### 🟠 BUG · `M` · [#120] Repeated "Downloads" folder permission prompts (macOS Sequoia)
 - **Issue:** [#120](https://github.com/AnyiWang/OpenCovibe/issues/120)
 - **Symptom:** Sequoia repeatedly re-asks for Downloads access even after granting full disk access.
 - **Root cause:** Ad-hoc code signing without a stable Team ID → macOS can't persist `SystemPolicyDownloadsFolder`. Real fix needs proper code signing.
-- **Owner:** _unassigned_  ·  **Status:** `[ ]`
+- **🚫 OUT OF SCOPE for this fork (team decision 2026-06-10) — macOS not targeted.**
+- **Owner:** —  ·  **Status:** `[✗]` (won't do)
 
 ---
 
