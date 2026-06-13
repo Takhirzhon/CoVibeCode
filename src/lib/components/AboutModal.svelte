@@ -2,9 +2,8 @@
   import { onMount } from "svelte";
   import { checkForUpdates } from "$lib/api";
   import { renderMarkdown } from "$lib/utils/markdown";
-  import { currentLocale, t } from "$lib/i18n/index.svelte";
+  import { t } from "$lib/i18n/index.svelte";
   import readmeEn from "../../../README.md?raw";
-  import readmeZhCN from "../../../README.zh-CN.md?raw";
 
   let { open = $bindable(false) }: { open: boolean } = $props();
 
@@ -30,12 +29,7 @@
       .trim();
   }
 
-  const readmeHtmlMap: Record<string, string> = {
-    en: processReadme(renderMarkdown(readmeEn)),
-    "zh-CN": processReadme(renderMarkdown(readmeZhCN)),
-  };
-
-  let readmeHtml = $derived(readmeHtmlMap[currentLocale()] ?? readmeHtmlMap.en);
+  const readmeHtml = processReadme(renderMarkdown(readmeEn));
 
   function handleBackdropClick(e: MouseEvent) {
     if (e.target === e.currentTarget) open = false;
