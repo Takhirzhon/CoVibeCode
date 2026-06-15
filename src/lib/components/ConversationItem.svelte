@@ -148,6 +148,7 @@
       {:else}
         <span
           class="truncate"
+          title={conversation.title}
           ondblclick={(e) => {
             e.stopPropagation();
             startRename();

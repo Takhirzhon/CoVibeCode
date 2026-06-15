@@ -3,7 +3,7 @@
   import { canResumeNow } from "$lib/stores";
   import { getNoSessionPersistence } from "$lib/stores/agent-settings-cache.svelte";
   import StatusBadge from "./StatusBadge.svelte";
-  import { relativeTime, truncate } from "$lib/utils/format";
+  import { relativeTime } from "$lib/utils/format";
   import { PLATFORM_PRESETS } from "$lib/utils/platform-presets";
   import { t } from "$lib/i18n/index.svelte";
   import { hasAttention } from "$lib/stores/attention-store.svelte";
@@ -28,7 +28,10 @@
     onresume?: (runId: string, mode: "resume") => void;
   } = $props();
 
-  const label = $derived(truncate(run.name || run.prompt, 28));
+  // Let CSS handle truncation (the title <span> has `truncate`). A hard JS char cap
+  // here truncated titles at 28 chars regardless of available width, so they were
+  // often cut off well before the rail ran out of room. (#132)
+  const label = $derived(run.name || run.prompt);
   const time = $derived(relativeTime(run.last_activity_at ?? run.started_at));
   const canResume = $derived(
     canResumeNow(run, run.status as any, getNoSessionPersistence(run.agent)),
@@ -90,7 +93,7 @@
   onkeydown={handleKeydown}
 >
   <div class="flex items-center justify-between gap-2">
-    <div class="flex items-center gap-1.5 min-w-0">
+    <div class="flex items-center gap-1.5 min-w-0 flex-1">
       {#if favorite}
         <svg
           class="h-3 w-3 shrink-0 text-yellow-500"
@@ -146,6 +149,7 @@
       {:else}
         <span
           class="truncate"
+          title={run.name || run.prompt}
           ondblclick={(e) => {
             e.stopPropagation();
             startRename();
