@@ -20,6 +20,7 @@
     onresume,
     ondelete,
     onarchive,
+    onstop,
   }: {
     conversation: ConversationGroup;
     selected?: boolean;
@@ -27,6 +28,7 @@
     onresume?: (runId: string, mode: "resume") => void;
     ondelete?: (conversation: ConversationGroup) => void;
     onarchive?: (conversation: ConversationGroup, archived: boolean) => void;
+    onstop?: (conversation: ConversationGroup) => void;
   } = $props();
 
   const run = $derived(conversation.latestRun);
@@ -39,6 +41,11 @@
   );
   const canDelete = $derived(
     conversation.runs.every((r) => TERMINAL_PHASES.includes(r.status as any)),
+  );
+  // A conversation can't be deleted while any run is still alive (e.g. "idle"/"done").
+  // Offer an explicit stop so the user can wind it down to a terminal state first.
+  const canStop = $derived(
+    conversation.runs.some((r) => !TERMINAL_PHASES.includes(r.status as any)),
   );
   const runCount = $derived(conversation.runs.length);
   const needsAttention = $derived(hasAttention(run.id));
@@ -177,6 +184,27 @@
             ><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8" /><path
               d="M21 3v5h-5"
             /></svg
+          >
+        </button>
+      {/if}
+      {#if canStop && onstop}
+        <button
+          class="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-accent text-muted-foreground hover:text-foreground transition-opacity"
+          onclick={(e) => {
+            e.stopPropagation();
+            onstop(conversation);
+          }}
+          title={t("sidebar_stop")}
+        >
+          <!-- Stop (square) -->
+          <svg
+            class="h-3.5 w-3.5"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="1" /></svg
           >
         </button>
       {/if}

@@ -325,6 +325,7 @@
   "sidebar_deleteConfirm": "删除对话",
   "sidebar_archive": "归档对话",
   "sidebar_unarchive": "取消归档",
+  "sidebar_stop": "停止会话（以便删除）",
   "sidebar_archived": "已归档 ({count})",
   "sidebar_deleteDesc": "对话将从侧边栏移除，数据保留在磁盘上，后续可恢复。",
   "sidebar_deleteCancel": "取消",

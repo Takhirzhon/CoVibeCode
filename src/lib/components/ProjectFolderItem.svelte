@@ -23,6 +23,7 @@
     onResume: (runId: string, mode: "resume") => void;
     onDelete?: (conversation: ConversationGroup) => void;
     onArchive?: (conversation: ConversationGroup, archived: boolean) => void;
+    onStop?: (conversation: ConversationGroup) => void;
     onNewChat?: () => void;
   };
 
@@ -33,6 +34,7 @@
     onResume?: never;
     onDelete?: never;
     onArchive?: never;
+    onStop?: never;
     onNewChat?: never;
   };
 
@@ -49,6 +51,7 @@
     onResume,
     onDelete,
     onArchive,
+    onStop,
     onNewChat,
   }: ChatProps | CustomProps = $props();
 
@@ -270,6 +273,7 @@
             onresume={onResume}
             ondelete={onDelete}
             onarchive={onArchive}
+            onstop={onStop}
           />
         {/each}
         {#if hasMore}

@@ -325,6 +325,7 @@
   "sidebar_deleteConfirm": "Delete conversation",
   "sidebar_archive": "Archive conversation",
   "sidebar_unarchive": "Unarchive conversation",
+  "sidebar_stop": "Stop session (enables delete)",
   "sidebar_archived": "Archived ({count})",
   "sidebar_deleteDesc": "This conversation will be removed from the sidebar. Data is kept on disk and can be restored later.",
   "sidebar_deleteCancel": "Cancel",

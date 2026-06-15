@@ -12,7 +12,9 @@
     listMemoryFiles,
     softDeleteRuns,
     setRunsArchived,
+    stopSession,
   } from "$lib/api";
+  import { TERMINAL_PHASES } from "$lib/stores";
   import ProjectFolderItem from "$lib/components/ProjectFolderItem.svelte";
   import ConversationItem from "$lib/components/ConversationItem.svelte";
   import CommandPalette from "$lib/components/CommandPalette.svelte";
@@ -933,6 +935,18 @@
   function cancelDeleteConversation() {
     deleteConfirmOpen = false;
     deleteTarget = null;
+  }
+
+  // Stop any still-alive runs in a conversation (e.g. "idle"/"done") so they reach
+  // a terminal state — which is what unlocks the delete button (#accidental-delete guard).
+  async function stopConversation(conv: ConversationGroup) {
+    const live = conv.runs.filter((r) => !TERMINAL_PHASES.includes(r.status as any));
+    await Promise.all(
+      live.map((r) =>
+        stopSession(r.id).catch((e) => dbgWarn("layout", "stopConversation failed", e)),
+      ),
+    );
+    window.dispatchEvent(new Event("ocv:runs-changed"));
   }
 
   // ── Remove project folder confirm flow ──
@@ -2211,6 +2225,7 @@
                     onResume={(runId, mode) => goto(`/chat?run=${runId}&resume=${mode}`)}
                     onDelete={requestDeleteConversation}
                     onArchive={archiveConversation}
+                    onStop={stopConversation}
                     onRemove={folder.isUncategorized
                       ? undefined
                       : () => requestRemoveProject(folder.cwd)}
@@ -2285,6 +2300,7 @@
                             onresume={(runId, mode) => goto(`/chat?run=${runId}&resume=${mode}`)}
                             ondelete={requestDeleteConversation}
                             onarchive={archiveConversation}
+                            onstop={stopConversation}
                           />
                         {/each}
                       </div>
