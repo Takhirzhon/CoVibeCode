@@ -12,26 +12,42 @@ use std::process::Command;
 
 #[tauri::command]
 pub async fn check_agent_cli(agent: String) -> Result<CliCheckResult, String> {
-    let binary = match agent.as_str() {
-        "claude" => "claude",
-        "codex" => "codex",
+    // For claude, honor the user's custom path/command override (#155) so this readout
+    // matches the binary sessions actually spawn — otherwise a wrapper that isn't named
+    // `claude` (or isn't on PATH) would falsely report "not installed" while sessions work.
+    let resolved = match agent.as_str() {
+        "claude" => crate::agent::claude_stream::resolve_claude_path(),
+        "codex" => "codex".to_string(),
         _ => return Err(format!("Unknown agent: {}", agent)),
     };
 
-    log::debug!("[diagnostics] check_agent_cli: agent={}", agent);
+    log::debug!(
+        "[diagnostics] check_agent_cli: agent={}, resolved={}",
+        agent,
+        resolved
+    );
     let aug_path = augmented_path();
 
-    // Check if binary exists (cross-platform: uses `where` on Windows, `which` on Unix)
-    let (found, path) = match crate::agent::claude_stream::which_binary(binary) {
-        Some(p) => (true, Some(p)),
-        None => (false, None),
+    // An override may be an explicit path or a bare command name. A path is checked directly;
+    // a bare name goes through PATH lookup (cross-platform: `where` on Windows, scan on Unix).
+    let (found, path) = if resolved.contains('/') || resolved.contains('\\') {
+        if Path::new(&resolved).is_file() {
+            (true, Some(resolved.clone()))
+        } else {
+            (false, None)
+        }
+    } else {
+        match crate::agent::claude_stream::which_binary(&resolved) {
+            Some(p) => (true, Some(p)),
+            None => (false, None),
+        }
     };
 
     // Get version if found. Spawn the RESOLVED path, not the bare name — on Windows the npm
     // binary is `codex.cmd`/`claude.cmd` and `Command::new("codex")` only auto-appends `.exe`,
     // so a bare-name spawn ENOENTs and version/auth would falsely report "not installed".
     let version = if found {
-        let exe = path.as_deref().unwrap_or(binary);
+        let exe = path.as_deref().unwrap_or(resolved.as_str());
         let ver_output = Command::new(exe)
             .arg("--version")
             .env("PATH", &aug_path)
