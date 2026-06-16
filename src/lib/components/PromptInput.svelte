@@ -326,6 +326,10 @@
     charCount: number;
     preview: string;
     ext?: string;
+    /** 1-based label shown on the chip and in the inline placeholder. */
+    seq?: number;
+    /** Marker inserted into the textarea at the cursor; expanded on send. */
+    placeholder?: string;
   }
 
   interface PathRef {
@@ -348,6 +352,9 @@
     }>
   >([]);
   let pastedBlocks = $state<PastedBlock[]>([]);
+  // Monotonic counter for paste placeholder labels (stable across removals).
+  let pasteSeq = 0;
+  const pastePlaceholder = (seq: number) => `⟦Pasted #${seq}⟧`;
   let pendingPathRefs = $state<PathRef[]>([]);
 
   let fileInput: HTMLInputElement | undefined = $state();
@@ -1216,8 +1223,22 @@
     const regularAtts = pendingAttachments.filter((a) => a.contentBase64);
     const pathRefAtts = pendingAttachments.filter((a) => a.filePath && !a.contentBase64);
 
-    // Combine paste blocks + typed text + path-reference file paths
-    const parts: string[] = pastedBlocks.map((b) => b.text);
+    // Expand paste blocks at their placeholder position within the typed text.
+    // Blocks without an in-text placeholder (e.g. drag-dropped files) are
+    // appended after the message rather than prepended before it.
+    let body = typed;
+    const trailing: string[] = [];
+    for (const b of pastedBlocks) {
+      if (b.placeholder && body.includes(b.placeholder)) {
+        body = body.split(b.placeholder).join(b.text);
+      } else {
+        trailing.push(b.text);
+      }
+    }
+
+    // Combine typed text (with pastes in place) + path references + leftover pastes
+    const parts: string[] = [];
+    if (body) parts.push(body);
     if (pathRefAtts.length > 0) {
       const refs = pathRefAtts.map((a) => `[PDF: ${a.filePath}]`).join("\n");
       parts.push(refs);
@@ -1226,8 +1247,7 @@
     if (pendingPathRefs.length > 0) {
       parts.push(pendingPathRefs.map((r) => wrapPathInBackticks(r.path)).join("\n"));
     }
-
-    if (typed) parts.push(typed);
+    parts.push(...trailing);
     const text = parts.join("\n\n");
     if (!text || disabled) return;
 
@@ -1493,6 +1513,19 @@
     const firstLine = lines[0].trim();
     const preview = firstLine.length > 40 ? firstLine.slice(0, 40) + "..." : firstLine;
 
+    // Drop a placeholder where the cursor is so the paste lands in place (not
+    // prepended) when the message is assembled on send.
+    const seq = ++pasteSeq;
+    const placeholder = pastePlaceholder(seq);
+    const start = textareaEl?.selectionStart ?? inputText.length;
+    const end = textareaEl?.selectionEnd ?? start;
+    inputText = inputText.slice(0, start) + placeholder + inputText.slice(end);
+    const caret = start + placeholder.length;
+    requestAnimationFrame(() => {
+      textareaEl?.setSelectionRange(caret, caret);
+      autoResize();
+    });
+
     pastedBlocks = [
       ...pastedBlocks,
       {
@@ -1501,6 +1534,8 @@
         lineCount,
         charCount,
         preview,
+        seq,
+        placeholder,
       },
     ];
 
@@ -1678,7 +1713,11 @@
   }
 
   function removePastedBlock(id: string) {
+    const removed = pastedBlocks.find((b) => b.id === id);
     pastedBlocks = pastedBlocks.filter((b) => b.id !== id);
+    if (removed?.placeholder && inputText.includes(removed.placeholder)) {
+      inputText = inputText.split(removed.placeholder).join("");
+    }
   }
 
   function handleSkillSelect(skillName: string) {
@@ -1940,6 +1979,9 @@
                 d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"
               />
             </svg>
+          {/if}
+          {#if block.seq}
+            <span class="font-medium text-blue-500 dark:text-blue-400">#{block.seq}</span>
           {/if}
           <span class="truncate max-w-[200px]">{block.preview}</span>
           <span class="text-blue-400 dark:text-blue-500"
