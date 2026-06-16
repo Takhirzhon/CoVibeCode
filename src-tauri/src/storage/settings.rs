@@ -804,6 +804,30 @@ fn apply_agent_patch(settings: &mut AgentSettings, patch: &serde_json::Value) {
             v.as_str().filter(|s| !s.is_empty()).map(|s| s.to_string())
         };
     }
+    if let Some(v) = patch.get("permission_mode") {
+        settings.permission_mode = if v.is_null() {
+            None
+        } else {
+            v.as_str().filter(|s| !s.is_empty()).map(|s| s.to_string())
+        };
+    }
+    if let Some(v) = patch.get("ephemeral") {
+        settings.ephemeral = if v.is_null() { None } else { v.as_bool() };
+    }
+    if let Some(v) = patch.get("profile") {
+        // Empty string clears the value (UI sets "" to unset profile).
+        settings.profile = if v.is_null() {
+            None
+        } else {
+            v.as_str().filter(|s| !s.is_empty()).map(|s| s.to_string())
+        };
+    }
+    if let Some(v) = patch.get("ignore_user_config") {
+        settings.ignore_user_config = if v.is_null() { None } else { v.as_bool() };
+    }
+    if let Some(v) = patch.get("ignore_rules") {
+        settings.ignore_rules = if v.is_null() { None } else { v.as_bool() };
+    }
 }
 
 pub fn update_agent_settings(
@@ -906,6 +930,56 @@ mod tests {
     }
 
     #[test]
+    fn apply_agent_patch_codex_flags_set_and_clear() {
+        let mut s = AgentSettings::default_for("codex");
+        assert_eq!(s.ephemeral, None);
+        assert_eq!(s.profile, None);
+        assert_eq!(s.ignore_user_config, None);
+        assert_eq!(s.ignore_rules, None);
+
+        // Set all four
+        apply_agent_patch(
+            &mut s,
+            &serde_json::json!({
+                "ephemeral": true,
+                "profile": "dev",
+                "ignore_user_config": true,
+                "ignore_rules": true,
+            }),
+        );
+        assert_eq!(s.ephemeral, Some(true));
+        assert_eq!(s.profile.as_deref(), Some("dev"));
+        assert_eq!(s.ignore_user_config, Some(true));
+        assert_eq!(s.ignore_rules, Some(true));
+
+        // Clear booleans with false (explicit off), profile with null
+        apply_agent_patch(
+            &mut s,
+            &serde_json::json!({
+                "ephemeral": false,
+                "profile": null,
+                "ignore_user_config": false,
+                "ignore_rules": false,
+            }),
+        );
+        assert_eq!(s.ephemeral, Some(false));
+        assert_eq!(s.profile, None);
+        assert_eq!(s.ignore_user_config, Some(false));
+        assert_eq!(s.ignore_rules, Some(false));
+
+        // Clear profile with empty string
+        apply_agent_patch(&mut s, &serde_json::json!({ "profile": "ci" }));
+        assert_eq!(s.profile.as_deref(), Some("ci"));
+        apply_agent_patch(&mut s, &serde_json::json!({ "profile": "" }));
+        assert_eq!(s.profile, None);
+
+        // Absent keys preserve existing values
+        apply_agent_patch(&mut s, &serde_json::json!({ "ephemeral": true }));
+        apply_agent_patch(&mut s, &serde_json::json!({ "model": "gpt-5" }));
+        assert_eq!(s.ephemeral, Some(true));
+    }
+
+    #[test]
     fn validate_ui_zoom_rejects_invalid() {
         assert!(validate_ui_zoom(&serde_json::json!(0.1)).is_err());
         assert!(validate_ui_zoom(&serde_json::json!(5.0)).is_err());
@@ -936,6 +1010,34 @@ mod tests {
         assert!(is_key_optional_platform("ollama"));
         assert!(!is_key_optional_platform("deepseek"));
         assert!(!is_key_optional_platform("unknown-platform"));
+    }
+
+    #[test]
+    fn apply_agent_patch_permission_mode_set_and_clear() {
+        let mut s = AgentSettings::default_for("codex");
+        assert_eq!(s.permission_mode, None);
+
+        // Set permission_mode to "plan"
+        apply_agent_patch(&mut s, &serde_json::json!({ "permission_mode": "plan" }));
+        assert_eq!(s.permission_mode, Some("plan".to_string()));
+
+        // Clear with empty string
+        apply_agent_patch(&mut s, &serde_json::json!({ "permission_mode": "" }));
+        assert_eq!(s.permission_mode, None);
+
+        // Set then clear with null
+        apply_agent_patch(
+            &mut s,
+            &serde_json::json!({ "permission_mode": "auto_all" }),
+        );
+        assert_eq!(s.permission_mode, Some("auto_all".to_string()));
+        apply_agent_patch(&mut s, &serde_json::json!({ "permission_mode": null }));
+        assert_eq!(s.permission_mode, None);
+
+        // Absent key doesn't touch existing value
+        apply_agent_patch(&mut s, &serde_json::json!({ "permission_mode": "ask" }));
+        apply_agent_patch(&mut s, &serde_json::json!({ "model": "opus" }));
+        assert_eq!(s.permission_mode, Some("ask".to_string()));
     }
 
     #[test]

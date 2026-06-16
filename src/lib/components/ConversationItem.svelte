@@ -33,7 +33,8 @@
 
   const run = $derived(conversation.latestRun);
   // Let CSS handle truncation (the title <span> has `truncate`). A hard JS char cap
-  // here caused premature ellipsis regardless of available width. (#132)
+  // here truncated titles at 28 chars regardless of available width, so they were
+  // often cut off well before the rail ran out of room. (#132)
   const label = $derived(conversation.title);
   const time = $derived(relativeTime(run.last_activity_at ?? run.started_at));
   const canResume = $derived(
@@ -49,6 +50,12 @@
   );
   const runCount = $derived(conversation.runs.length);
   const needsAttention = $derived(hasAttention(run.id));
+  // Codex completed + resumable → display as "idle"
+  const displayStatus = $derived(
+    run.status === "completed" && run.conversation_ref?.kind === "codex_thread"
+      ? ("idle" as const)
+      : run.status,
+  );
 
   // ── Inline rename (self-contained, mirrors RunListItem) ──
 
@@ -150,6 +157,7 @@
       {:else}
         <span
           class="truncate"
+          title={conversation.title}
           ondblclick={(e) => {
             e.stopPropagation();
             startRename();
@@ -277,7 +285,7 @@
           >
         </button>
       {/if}
-      <StatusBadge status={run.status} attention={needsAttention} class="shrink-0" />
+      <StatusBadge status={displayStatus} attention={needsAttention} class="shrink-0" />
     </div>
   </div>
   <div class="mt-0.5 flex items-center gap-2 text-xs text-muted-foreground">
@@ -299,7 +307,7 @@
           /><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20" /><path d="M2 12h20" /></svg
         >
       {/if}
-      {#if run.platform_id && run.platform_id !== "anthropic"}
+      {#if run.agent !== "codex" && run.platform_id && run.platform_id !== "anthropic"}
         <span class="shrink-0">&middot;</span>
         <span class="truncate">{platformLabel(run.platform_id)}</span>
       {/if}

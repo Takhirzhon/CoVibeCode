@@ -3,7 +3,7 @@
   import { canResumeNow } from "$lib/stores";
   import { getNoSessionPersistence } from "$lib/stores/agent-settings-cache.svelte";
   import StatusBadge from "./StatusBadge.svelte";
-  import { relativeTime, truncate } from "$lib/utils/format";
+  import { relativeTime } from "$lib/utils/format";
   import { PLATFORM_PRESETS } from "$lib/utils/platform-presets";
   import { t } from "$lib/i18n/index.svelte";
   import { hasAttention } from "$lib/stores/attention-store.svelte";
@@ -28,12 +28,21 @@
     onresume?: (runId: string, mode: "resume") => void;
   } = $props();
 
-  const label = $derived(truncate(run.name || run.prompt, 28));
+  // Let CSS handle truncation (the title <span> has `truncate`). A hard JS char cap
+  // here truncated titles at 28 chars regardless of available width, so they were
+  // often cut off well before the rail ran out of room. (#132)
+  const label = $derived(run.name || run.prompt);
   const time = $derived(relativeTime(run.last_activity_at ?? run.started_at));
   const canResume = $derived(
     canResumeNow(run, run.status as any, getNoSessionPersistence(run.agent)),
   );
   const needsAttention = $derived(hasAttention(run.id));
+  // Codex completed + resumable → display as "idle" (consistent with Claude between turns)
+  const displayStatus = $derived(
+    run.status === "completed" && run.conversation_ref?.kind === "codex_thread"
+      ? ("idle" as const)
+      : run.status,
+  );
 
   let editing = $state(false);
   let editValue = $state("");
@@ -84,7 +93,7 @@
   onkeydown={handleKeydown}
 >
   <div class="flex items-center justify-between gap-2">
-    <div class="flex items-center gap-1.5 min-w-0">
+    <div class="flex items-center gap-1.5 min-w-0 flex-1">
       {#if favorite}
         <svg
           class="h-3 w-3 shrink-0 text-yellow-500"
@@ -140,6 +149,7 @@
       {:else}
         <span
           class="truncate"
+          title={run.name || run.prompt}
           ondblclick={(e) => {
             e.stopPropagation();
             startRename();
@@ -171,7 +181,7 @@
           >
         </button>
       {/if}
-      <StatusBadge status={run.status} attention={needsAttention} class="shrink-0" />
+      <StatusBadge status={displayStatus} attention={needsAttention} class="shrink-0" />
     </div>
   </div>
   <div class="mt-0.5 flex items-center gap-2 text-xs text-muted-foreground">
@@ -194,7 +204,7 @@
           /><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20" /><path d="M2 12h20" /></svg
         >
       {/if}
-      {#if run.platform_id && run.platform_id !== "anthropic"}
+      {#if run.agent !== "codex" && run.platform_id && run.platform_id !== "anthropic"}
         <span class="shrink-0">&middot;</span>
         <span class="truncate">{platformLabel(run.platform_id)}</span>
       {/if}

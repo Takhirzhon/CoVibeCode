@@ -64,6 +64,7 @@ pub fn validate_bus_event(ev: &BusEvent) -> Option<ValidationWarn> {
             None
         }
         BusEvent::ToolProgress { tool_use_id, .. }
+        | BusEvent::ToolOutputDelta { tool_use_id, .. }
         | BusEvent::ToolUseSummary { tool_use_id, .. } => {
             if tool_use_id.is_empty() {
                 return Some(ValidationWarn {
@@ -87,6 +88,9 @@ pub fn validate_bus_event(ev: &BusEvent) -> Option<ValidationWarn> {
             }
             None // ALWAYS pass through
         }
+        // State-class (Codex thread goal): never drop — the GoalPanel needs every update,
+        // including the null-goal "cleared" signal.
+        BusEvent::GoalUpdate { .. } => None,
         // Everything else: pass through
         _ => None,
     }
