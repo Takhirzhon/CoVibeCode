@@ -57,6 +57,7 @@
   import { uuid } from "$lib/utils/uuid";
   import type { ClipboardFileInfo } from "$lib/api";
   import type { PromptInputSnapshot } from "$lib/types";
+  import { getDraft, setDraft } from "$lib/stores/prompt-drafts";
   import {
     type HistoryState,
     type HistoryAction,
@@ -358,6 +359,50 @@
     if (checkAndReset(histState, userHistory.length, runId)) {
       dbg("prompt-history", "reset", { runId, len: userHistory.length });
     }
+  });
+
+  // ── Per-conversation draft persistence ──
+  // Stash unsent text per run so switching conversations (e.g. to approve a
+  // pending one) doesn't discard what was typed. See lib/stores/prompt-drafts.
+  let activeDraftRunId = runId;
+  let draftHydrated = false;
+
+  function applyDraft(snapshot: PromptInputSnapshot | null): void {
+    inputText = snapshot?.text ?? "";
+    pendingAttachments = snapshot ? [...snapshot.attachments] : [];
+    pastedBlocks = snapshot ? ([...snapshot.pastedBlocks] as PastedBlock[]) : [];
+    pendingPathRefs = snapshot?.pathRefs ? [...snapshot.pathRefs] : [];
+    resetHistory(histState);
+    requestAnimationFrame(() => autoResize());
+  }
+
+  onMount(() => {
+    applyDraft(getDraft(runId));
+    activeDraftRunId = runId;
+    draftHydrated = true;
+  });
+
+  // Live runId change (component reused, not remounted): save the outgoing
+  // draft, then load the incoming run's draft.
+  $effect(() => {
+    const id = runId;
+    if (!draftHydrated || id === activeDraftRunId) return;
+    setDraft(activeDraftRunId, getInputSnapshot());
+    applyDraft(getDraft(id));
+    activeDraftRunId = id;
+  });
+
+  // Autosave the current input under the active run on every edit. Clears the
+  // stored draft automatically once the box is empty (e.g. after sending).
+  $effect(() => {
+    const snapshot: PromptInputSnapshot = {
+      text: inputText,
+      attachments: pendingAttachments,
+      pastedBlocks,
+      pathRefs: pendingPathRefs,
+    };
+    if (!draftHydrated) return;
+    setDraft(activeDraftRunId, snapshot);
   });
 
   /** Chunked ArrayBuffer→base64 (32KB chunks — safe for large files, avoids stack overflow). */
