@@ -4098,6 +4098,7 @@
     updatedInput?: Record<string, unknown>,
     denyMessage?: string,
     interrupt?: boolean,
+    rememberTool?: boolean,
   ) {
     if (!store.run || !store.sessionAlive) return;
     const runId = store.run.id; // snapshot — store.run may change after await
@@ -4109,6 +4110,7 @@
       updatedInput,
       denyMessage,
       interrupt,
+      rememberTool,
     });
     try {
       // Set pending mode override BEFORE responding (so reducer picks it up)
@@ -4128,6 +4130,7 @@
         updatedInput,
         denyMessage,
         interrupt,
+        rememberTool,
       );
       // Optimistic resolve + clear attention flag
       resolvePermissionOptimistic(store, runId, requestId, behavior);
