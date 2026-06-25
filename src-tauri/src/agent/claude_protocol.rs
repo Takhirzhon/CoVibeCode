@@ -609,6 +609,37 @@ impl ProtocolState {
                             content,
                         });
                     }
+                } else if subtype == "api_retry" {
+                    // CLI is retrying the API call (e.g. after a timeout/overload).
+                    // Surface via the status channel so the UI can show "Retrying API…".
+                    let attempt = raw.get("attempt").and_then(|v| v.as_u64());
+                    let delay_ms = raw
+                        .get("delayMs")
+                        .or_else(|| raw.get("delay_ms"))
+                        .and_then(|v| v.as_u64());
+                    log::debug!(
+                        "[protocol] system/api_retry: attempt={:?}, delay_ms={:?}",
+                        attempt,
+                        delay_ms
+                    );
+                    events.push(BusEvent::SystemStatus {
+                        run_id: run_id.to_string(),
+                        status: Some("api_retry".to_string()),
+                        data: raw.clone(),
+                    });
+                } else if subtype == "thinking_tokens" {
+                    // Extended-thinking token telemetry emitted while the model thinks.
+                    // High-frequency and informational — forward as Raw, don't count as unknown.
+                    let tokens = raw
+                        .get("tokens")
+                        .or_else(|| raw.get("thinking_tokens"))
+                        .and_then(|v| v.as_u64());
+                    log::debug!("[protocol] system/thinking_tokens: tokens={:?}", tokens);
+                    events.push(BusEvent::Raw {
+                        run_id: run_id.to_string(),
+                        source: "claude_system_thinking_tokens".to_string(),
+                        data: raw.clone(),
+                    });
                 } else if !subtype.is_empty() {
                     // Unknown system subtype — wrap as Raw for forward compatibility
                     log::debug!("[protocol] unknown system subtype: {}", subtype);
@@ -1465,6 +1496,38 @@ mod tests {
             }
             other => panic!("expected SystemStatus, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_system_api_retry() {
+        let mut ps = ProtocolState::new(false);
+        let raw = json!({"type": "system", "subtype": "api_retry", "attempt": 2, "delayMs": 60000});
+        let events = ps.map_event(RUN, &raw);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            BusEvent::SystemStatus { status, .. } => {
+                assert_eq!(status.as_deref(), Some("api_retry"));
+            }
+            other => panic!("expected SystemStatus, got {:?}", other),
+        }
+        // Handled, not counted as unknown.
+        assert_eq!(ps.stats.unknown_event_count, 0);
+    }
+
+    #[test]
+    fn test_system_thinking_tokens() {
+        let mut ps = ProtocolState::new(false);
+        let raw = json!({"type": "system", "subtype": "thinking_tokens", "tokens": 1234});
+        let events = ps.map_event(RUN, &raw);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            BusEvent::Raw { source, .. } => {
+                assert_eq!(source, "claude_system_thinking_tokens");
+            }
+            other => panic!("expected Raw, got {:?}", other),
+        }
+        // Handled, not counted as unknown.
+        assert_eq!(ps.stats.unknown_event_count, 0);
     }
 
     #[test]
