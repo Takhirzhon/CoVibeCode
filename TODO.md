@@ -5,7 +5,7 @@
 > This file tracks the open issues + open PR from upstream that we want to address in our fork.
 > Items are grouped **by platform** first, then ordered **by type/severity** within each platform.
 >
-> Last synced with upstream: **2026-06-03** (our fork is at `v0.1.64`, even with upstream's latest merged PRs #146/#147/#148).
+> Last synced with upstream: **2026-07-08** (merged upstream `v0.2.5`; our fork carries the OAuth cold-restart fix, the `remember_tool` permission feature, and Windows CLI session discovery [PR #169, open]).
 
 ## Tech stack quick reference
 - **Frontend:** SvelteKit + Tailwind (`src/`)
@@ -27,6 +27,24 @@
 ---
 
 ## 🌐 Cross-platform
+
+### 🟠 BUG · `M` · Session restore drops assistant turns (revisit shows only "You" messages)
+- **Source:** discovered in-house (screenshot 2026-07-07); **not yet filed upstream** — candidate to report + PR.
+- **Symptom:** Live chat renders correctly (request → response → request → response). After switching to another chat and back, the reopened chat shows **only the "You" turns, stacked together — every assistant response is gone.** The per-turn token separators (`… · 6.6k out · …`) confirm the responses ran and are persisted → this is a **render/rehydration bug, not data loss.**
+- **Localized to:** `src/lib/stores/session-store.svelte.ts` → `loadRun()` snapshot fast-path (`_tryApplySnapshot`). On a snapshot hit, `loadRun` restores `this.timeline` from the serialized snapshot and **skips event replay** (see comment ~L1700: *"a snapshot-hit loadRun skips event replay, so anything not serialized here is lost on revisit"*).
+- **Suspected root cause:** the snapshot's `timeline` is missing assistant entries (serialized before the turn committed them, or dropped on serialize) **while `_seenMessageIds` still lists their IDs** — so any follow-up replay also dedup-skips them → assistant turns permanently absent on revisit.
+- **Next step:** reproduce → inspect a persisted snapshot body for a run (does `timeline` contain the assistant entries?) → fix the serialize point or the restore/dedup reconciliation. Needs live testing; do **not** blind-patch rehydration.
+- **Owner:** _unassigned_  ·  **Status:** `[ ]` (diagnosed, not fixed)
+
+### 🟠 BUG · `S` · [#173] Cannot add more than one hook
+- **Issue:** [#173](https://github.com/AnyiWang/OpenCovibe/issues/173) (opened 2026-06-25, no triage yet)
+- **Relevance:** touches our hook plumbing (`src-tauri/src/hooks/`, settings hook editor). Likely a UI/storage bug capping hooks at one entry. Small, self-contained — good PR candidate for upstream.
+- **Owner:** _unassigned_  ·  **Status:** `[ ]`
+
+### 🟠 BUG · `S` · [#174] Skills load but `/xxx` reports "no such command" after send
+- **Issue:** [#174](https://github.com/AnyiWang/OpenCovibe/issues/174) (opened 2026-07-07, newest)
+- **Relevance:** the `isKnownSlashCommand` / session-command path (`session-store.svelte.ts`). Skills are listed but a `/skill` send is rejected — likely a name-matching or `sessionCommands` timing gap. Small.
+- **Owner:** _unassigned_  ·  **Status:** `[ ]`
 
 ### 🔴 CRITICAL BUG · `M` · [#131] Claude Code v2.1.150 breaks pipe communication
 - **Issue:** [#131](https://github.com/AnyiWang/OpenCovibe/issues/131)
