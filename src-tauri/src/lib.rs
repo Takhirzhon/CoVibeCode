@@ -368,6 +368,27 @@ pub fn run() {
             app.manage(broadcaster);
             app.manage(emitter);
 
+            // Credential warm-up: refresh the Claude OAuth token ONCE at startup, before
+            // the frontend's claude burst (CLI info / auth status / plugin list) and any
+            // auto-resumed session can race it. get_cli_info holds the claude_cred_gate
+            // while it runs, so the gated diagnostics and the session-spawn barrier all
+            // wait on this single refresh — closing the rotating-refresh-token race that
+            // logged the user out on cold reopen. Best-effort: a failure here just means
+            // the normal paths run as before.
+            let warmup_cache = app.state::<CliInfoCache>().inner().clone();
+            tauri::async_runtime::spawn(async move {
+                crate::agent::claude_stream::log_cred_state("warmup:before");
+                match crate::agent::control::get_cli_info(&warmup_cache, true).await {
+                    Ok(_) => log::debug!("[app] credential warm-up complete"),
+                    Err(e) => log::warn!(
+                        "[app] credential warm-up failed: {} ({})",
+                        e.message,
+                        e.code
+                    ),
+                }
+                crate::agent::claude_stream::log_cred_state("warmup:after");
+            });
+
             // Start web server (non-blocking, spawns async task)
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {

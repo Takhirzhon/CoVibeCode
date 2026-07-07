@@ -309,6 +309,62 @@ pub fn augmented_path() -> String {
         .unwrap_or(current_path)
 }
 
+/// Process-wide gate that serializes short-lived `claude` subprocess invocations which
+/// can trigger an OAuth token refresh (CLI-info probe, `auth status`, plugin commands).
+///
+/// The Claude CLI keeps OAuth credentials in `~/.claude/.credentials.json` and ROTATES
+/// the refresh token on every refresh. At startup CoVibeCode fires several of these
+/// subprocesses near-simultaneously; on a cold reopen past the ~8h access-token expiry
+/// each one independently tries to refresh using the same (rotating) refresh token. The
+/// losers of that race fail or clobber the freshly-written credentials with a now-stale
+/// refresh token — logging the user out. Holding this gate around each spawn lets the
+/// first invocation refresh + persist, so the rest read already-valid credentials.
+///
+/// Deliberately NOT held around long-lived chat sessions (they run for minutes; a global
+/// lock would stall the app). Those are user-initiated and rarely coincide with the
+/// cold-start refresh burst.
+pub fn claude_cred_gate() -> &'static tokio::sync::Mutex<()> {
+    static GATE: once_cell::sync::Lazy<tokio::sync::Mutex<()>> =
+        once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(()));
+    &GATE
+}
+
+/// Log the current Claude OAuth credential state (token expiry + a short hash of the
+/// refresh token) for diagnosing the logout-on-restart race. NEVER logs the tokens
+/// themselves — only a 12-char SHA-256 prefix, so we can tell whether the refresh token
+/// CHANGED across a startup burst (the tell-tale of a rotation clobber). Best-effort:
+/// silent no-op if the credentials file is missing or unparseable.
+pub fn log_cred_state(context: &str) {
+    use sha2::{Digest, Sha256};
+    let Some(home) = crate::storage::home_dir() else {
+        return;
+    };
+    let path = std::path::Path::new(&home)
+        .join(".claude")
+        .join(".credentials.json");
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(parsed) = serde_json::from_str::<Value>(&contents) else {
+        return;
+    };
+    let oauth = parsed.get("claudeAiOauth").unwrap_or(&parsed);
+    let expires_at = oauth.get("expiresAt").and_then(|v| v.as_i64());
+    let rt_hash = oauth.get("refreshToken").and_then(|v| v.as_str()).map(|t| {
+        Sha256::digest(t.as_bytes())
+            .iter()
+            .take(6)
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>()
+    });
+    log::debug!(
+        "[cred] {}: expiresAt={:?}, refreshToken#={:?}",
+        context,
+        expires_at,
+        rt_hash
+    );
+}
+
 /// Cross-platform binary lookup.
 /// - Windows: uses `where` command.
 /// - Unix: pure Rust PATH traversal (avoids dependency on `which` binary,

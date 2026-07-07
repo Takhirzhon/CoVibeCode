@@ -2175,6 +2175,12 @@ async fn spawn_cli_process(
             }
         }
 
+        // Barrier: wait for any in-flight startup credential refresh (the warm-up or a
+        // gated diagnostic) to finish before spawning, so this session reads already-fresh
+        // OAuth credentials instead of racing a concurrent token refresh. We hold the gate
+        // only momentarily (acquire + immediate release) — never for the session's lifetime.
+        drop(claude_stream::claude_cred_gate().lock().await);
+
         cmd.hide_console().kill_on_drop(true).spawn().map_err(|e| {
             log::error!("[session] Failed to spawn claude: {}", e);
             format!("Failed to spawn claude: {}", e)

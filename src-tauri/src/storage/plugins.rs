@@ -506,6 +506,10 @@ pub async fn run_plugin_command(
         .stderr(std::process::Stdio::piped());
 
     cmd.hide_console().kill_on_drop(true);
+
+    // Serialize against other startup claude spawns so a burst doesn't race the rotating
+    // OAuth token refresh (see claude_cred_gate). Held until the process exits below.
+    let _cred_guard = crate::agent::claude_stream::claude_cred_gate().lock().await;
     let child = cmd.spawn().map_err(|e| {
         log::error!("[plugins] failed to spawn claude: {}", e);
         format!("Failed to spawn claude: {}", e)

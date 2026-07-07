@@ -545,6 +545,9 @@ pub(crate) fn read_env_from_shell_config(_var_name: &str) -> Option<(String, Str
 pub(crate) async fn check_cli_oauth() -> (bool, Option<String>) {
     let claude_bin = claude_stream::resolve_claude_path();
     if claude_bin != "claude" || which_binary("claude") {
+        // Serialize against other startup claude spawns so only one process refreshes
+        // the rotating OAuth token (see claude_cred_gate).
+        let _cred_guard = claude_stream::claude_cred_gate().lock().await;
         match tokio::time::timeout(
             std::time::Duration::from_secs(10),
             Command::new(&claude_bin)

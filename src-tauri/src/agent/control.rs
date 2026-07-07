@@ -1,4 +1,6 @@
-use crate::agent::claude_stream::{augmented_path, resolve_claude_path};
+use crate::agent::claude_stream::{
+    augmented_path, claude_cred_gate, log_cred_state, resolve_claude_path,
+};
 use crate::models::{now_iso, CliAccount, CliCommand, CliInfo, CliInfoError, CliModelInfo};
 use crate::process_ext::HideConsole;
 use serde_json::Value;
@@ -56,6 +58,11 @@ pub async fn get_cli_info(cache: &CliInfoCache, force: bool) -> Result<CliInfo, 
             message: "Claude CLI binary not found".to_string(),
         });
     }
+
+    // Serialize against other startup claude spawns so only one process refreshes the
+    // rotating OAuth token (see claude_cred_gate). Held until the process exits below.
+    let cred_guard = claude_cred_gate().lock().await;
+    log_cred_state("cli_info:before");
 
     // Spawn process
     let path_env = augmented_path();
@@ -127,6 +134,9 @@ pub async fn get_cli_info(cache: &CliInfoCache, force: bool) -> Result<CliInfo, 
     // Kill process regardless
     let _ = child.kill().await;
     let _ = child.wait().await;
+
+    log_cred_state("cli_info:after");
+    drop(cred_guard);
 
     let cli_info = match result {
         Ok(Ok(info)) => info,
