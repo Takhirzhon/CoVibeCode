@@ -4394,6 +4394,46 @@ describe("SessionStore reducer", () => {
         expect(testStore.timeline.length).toBeGreaterThan(0);
         warnSpy.mockClear();
       });
+
+      it("falls back to replay when a valid snapshot dropped its assistant turns", async () => {
+        // Regression: a cached snapshot can serialize a timeline that kept the user
+        // turns but lost every assistant turn. It parses/validates fine, so the old
+        // code trusted it and the chat rendered only "You" messages on revisit.
+        const termRun = makeRun("run-snap-4", { status: "completed", agent: "claude" });
+        mockGetRun.mockResolvedValue(termRun);
+
+        // Build a real snapshot, then corrupt it the way the IDB cache did: keep the
+        // user entries, drop the assistant entries (and the dedup set) from the body.
+        const refStore = new SessionStore();
+        refStore.run = termRun;
+        refStore.phase = "completed";
+        refStore.applyEventBatch(simpleChatEvents as BusEvent[], { replayOnly: true });
+        expect(refStore.timeline.some((e) => e.kind === "assistant")).toBe(true);
+
+        const parsed = JSON.parse(
+          (refStore as unknown as { _buildSnapshot(): string })._buildSnapshot(),
+        );
+        parsed.timeline = (parsed.timeline as { kind: string }[]).filter((e) => e.kind === "user");
+        parsed._seenMessageIds = [];
+        expect(parsed.timeline.length).toBeGreaterThan(0);
+
+        mockReadSnapshot.mockResolvedValue(JSON.stringify(parsed));
+        mockGetBusEvents.mockResolvedValue(simpleChatEvents);
+
+        const testStore = new SessionStore();
+        await testStore.loadRun("run-snap-4");
+
+        // Corruption detected → snapshot dropped → full replay from the event log.
+        expect(mockDeleteSnapshot).toHaveBeenCalledWith("run-snap-4");
+        expect(mockGetBusEvents).toHaveBeenCalledWith("run-snap-4");
+        // Assistant turns are restored, and the timeline matches a clean replay
+        // (compare kind + content; `ts` is wall-clock for fixtures without one).
+        const shape = (tl: typeof testStore.timeline) =>
+          tl.map((e) => ({ kind: e.kind, content: (e as { content?: string }).content }));
+        expect(testStore.timeline.some((e) => e.kind === "assistant")).toBe(true);
+        expect(shape(testStore.timeline)).toEqual(shape(refStore.timeline));
+        warnSpy.mockClear();
+      });
     });
 
     describe("loadRun write guard", () => {

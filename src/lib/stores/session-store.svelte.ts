@@ -1710,6 +1710,42 @@ export class SessionStore {
     return JSON.stringify(obj);
   }
 
+  /** Sanity-check a freshly-restored snapshot's timeline. A cached snapshot can
+   *  serialize a timeline that dropped its assistant turns while user turns survive;
+   *  on revisit the assistant `message_complete` events are never re-applied (the
+   *  snapshot path skips replay), so the chat shows only the user's messages. When
+   *  that's detected the caller discards the snapshot and does a full event replay
+   *  (source of truth), which also rewrites a correct snapshot — so it self-heals.
+   *
+   *  Returns false only for a clearly-corrupt restore:
+   *   - real turns exist (≥1 user) but produced zero assistant AND zero tool output, or
+   *   - a `_seenMessageIds` id has no surviving assistant entry (partial drop). */
+  private _restoredSnapshotIsUsable(): boolean {
+    let users = 0;
+    let assistants = 0;
+    let tools = 0;
+    const present = new Set<string>();
+    const walk = (entries: TimelineEntry[]): void => {
+      for (const e of entries) {
+        if (e.kind === "user") {
+          users++;
+        } else if (e.kind === "assistant") {
+          assistants++;
+          present.add(e.id);
+        } else if (e.kind === "tool") {
+          tools++;
+          if (e.subTimeline) walk(e.subTimeline);
+        }
+      }
+    };
+    walk(this.timeline);
+    if (users > 0 && assistants === 0 && tools === 0) return false;
+    for (const id of this._seenMessageIds) {
+      if (!present.has(id)) return false;
+    }
+    return true;
+  }
+
   /** Parse snapshot body string. Returns parsed object or null if invalid JSON. */
   private _parseSnapshotBody(body: string): Record<string, unknown> | null {
     try {
@@ -1956,7 +1992,7 @@ export class SessionStore {
               dbg("store", "idle snapshot seq=0, skipping for full replay");
               snapshotCache.deleteSnapshot(id).catch(() => {});
               snapshotBody = null; // fall through to miss path
-            } else if (this._tryApplySnapshot(parsed)) {
+            } else if (this._tryApplySnapshot(parsed) && this._restoredSnapshotIsUsable()) {
               snapshotHit = true;
               // Align _lastSnapshotSeq to prevent unnecessary rewrite on first idle
               this._lastSnapshotSeq = this._lastProcessedSeq;
@@ -1995,7 +2031,27 @@ export class SessionStore {
                 this._wsSubscribeWithSeq(id, this._lastProcessedSeq);
               }
             } else {
-              snapshotBody = null; // shape validation failed
+              // Shape validation failed, or _tryApplySnapshot succeeded but the restored
+              // timeline was corrupt (assistant turns dropped — see
+              // _restoredSnapshotIsUsable). In the corrupt case the store was already
+              // mutated by the partial restore, so reset it and drop the bad snapshot;
+              // the replay path below then rebuilds from the event log and rewrites a
+              // correct snapshot.
+              if (this.timeline.length > 0 || this._seenMessageIds.size > 0) {
+                dbgWarn(
+                  "store",
+                  "snapshot corrupt (timeline missing assistant turns) — discarding for full replay",
+                  { id },
+                );
+                this._clearContentState();
+                this._useChatTimelineForRun =
+                  this.run!.execution_path === "session_actor" ||
+                  (this.run!.execution_path === "pipe_exec" &&
+                    !isTerminal &&
+                    !!this.run!.conversation_ref);
+                snapshotCache.deleteSnapshot(id).catch(() => {});
+              }
+              snapshotBody = null; // fall through to the miss/replay path
             }
           }
         }
