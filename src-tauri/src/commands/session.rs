@@ -1499,9 +1499,11 @@ pub async fn respond_permission(
     updated_input: Option<serde_json::Value>,
     deny_message: Option<String>,
     interrupt: Option<bool>,
+    remember_tool: Option<bool>,
 ) -> Result<(), String> {
+    let remember_tool = remember_tool.unwrap_or(false);
     log::debug!(
-        "[session] respond_permission: run_id={}, req_id={}, behavior={}, updated_perms={}, has_updated_input={}, has_deny_message={}, interrupt={:?}",
+        "[session] respond_permission: run_id={}, req_id={}, behavior={}, updated_perms={}, has_updated_input={}, has_deny_message={}, interrupt={:?}, remember_tool={}",
         run_id,
         request_id,
         behavior,
@@ -1509,6 +1511,7 @@ pub async fn respond_permission(
         updated_input.is_some(),
         deny_message.is_some(),
         interrupt,
+        remember_tool,
     );
 
     let cmd_tx = get_cmd_tx(&sessions, &run_id).await?;
@@ -1546,6 +1549,7 @@ pub async fn respond_permission(
         .send(ActorCommand::RespondPermission {
             request_id: request_id.clone(),
             response,
+            remember_tool,
             reply: reply_tx,
         })
         .await
