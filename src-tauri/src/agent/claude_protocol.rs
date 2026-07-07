@@ -634,7 +634,14 @@ impl ProtocolState {
                         .get("tokens")
                         .or_else(|| raw.get("thinking_tokens"))
                         .and_then(|v| v.as_u64());
-                    log::debug!("[protocol] system/thinking_tokens: tokens={:?}", tokens);
+                    // Fires every ~1-2s while the model thinks — only log at debug when we
+                    // actually parsed a count; otherwise trace (with raw keys to discover
+                    // the real field) so it doesn't spam the debug log.
+                    if let Some(n) = tokens {
+                        log::debug!("[protocol] system/thinking_tokens: tokens={}", n);
+                    } else {
+                        log::trace!("[protocol] system/thinking_tokens: {}", raw);
+                    }
                     events.push(BusEvent::Raw {
                         run_id: run_id.to_string(),
                         source: "claude_system_thinking_tokens".to_string(),
