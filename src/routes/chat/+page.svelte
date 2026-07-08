@@ -1690,22 +1690,36 @@
     });
   });
 
-  // Consume ?resume= URL param for session resume via sidebar button
+  // Consume ?resume= URL param for session resume via sidebar button.
+  // Non-reactive guard: this effect reads $page.url AND writes it (replaceState below).
+  // The replaceState write is a $page.url dependency, so the effect re-runs — and because
+  // the cleaned URL doesn't propagate before the synchronous re-run, the "delete resume"
+  // check alone doesn't stop it: it keeps seeing ?resume=, calls replaceState again, and
+  // trips Svelte's effect_update_depth_exceeded (infinite loop → frozen UI). Processing
+  // each (run,resume) pair exactly once breaks the cycle regardless of that timing.
+  let _consumedResumeKey = "";
   $effect(() => {
     const url = $page.url;
     const paramRunId = url.searchParams.get("run");
     const resumeMode = url.searchParams.get("resume") as SessionMode | null;
 
-    if (paramRunId && resumeMode) {
+    if (!paramRunId || !resumeMode) {
+      // No pending resume → clear so a later resume of the same run is honored.
+      _consumedResumeKey = "";
+      return;
+    }
+
+    const key = `${paramRunId}:${resumeMode}`;
+    if (key === _consumedResumeKey) return; // already consumed this param
+    _consumedResumeKey = key;
+
+    untrack(() => {
       // Clean URL immediately to prevent re-trigger on refresh
       const clean = new URL(url);
       clean.searchParams.delete("resume");
       replaceState(clean, {});
-
-      untrack(() => {
-        handleResume(resumeMode, paramRunId);
-      });
-    }
+      handleResume(resumeMode, paramRunId);
+    });
   });
 
   // Auto-focus prompt input on mount + listen for status bar toggle + register chat keybindings
