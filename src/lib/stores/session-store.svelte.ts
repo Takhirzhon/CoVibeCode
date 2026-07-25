@@ -3324,6 +3324,15 @@ export class SessionStore {
 
       case "user_message": {
         const tl = getTl();
+        // Stable-uuid dedup (replay AND live): on resume the CLI re-streams recent turns,
+        // re-emitting user_message events with the SAME `uuid`. Their assistant twins get
+        // deduped by message_id, so without this the re-emitted prompts pile up at the end
+        // of the timeline as orphaned "You" turns (the reported "prompts gathered at the
+        // bottom"). A genuine repeat of the same text carries a DIFFERENT uuid, so keying
+        // on uuid (not content) is safe. Skip only when an entry already carries this uuid.
+        if (ev.uuid && tl.some((e) => e.kind === "user" && e.cliUuid === ev.uuid)) {
+          break;
+        }
         // Content-based dedup: only in live mode (replayOnly=false) where an optimistic
         // user entry was already added by startSession/sendMessage.  During replay
         // (replayOnly=true), every event from events.jsonl is authoritative —

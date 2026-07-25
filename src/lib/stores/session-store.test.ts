@@ -500,6 +500,53 @@ describe("SessionStore reducer", () => {
         expect(userEntry.cliUuid).toBe("cli-uuid-merge");
       }
     });
+
+    it("dedups re-emitted user_message by uuid on resume replay (no bottom pile-up)", () => {
+      store.run = makeRun("run-reemit");
+      store.phase = "running";
+      const events = [
+        { type: "user_message", run_id: "run-reemit", text: "First question", uuid: "u-1" },
+        { type: "message_complete", run_id: "run-reemit", message_id: "m-1", text: "First answer" },
+        { type: "user_message", run_id: "run-reemit", text: "Second question", uuid: "u-2" },
+        {
+          type: "message_complete",
+          run_id: "run-reemit",
+          message_id: "m-2",
+          text: "Second answer",
+        },
+        // Resume re-streams the recent turns: SAME uuids + SAME message_ids.
+        { type: "user_message", run_id: "run-reemit", text: "First question", uuid: "u-1" },
+        { type: "message_complete", run_id: "run-reemit", message_id: "m-1", text: "First answer" },
+        { type: "user_message", run_id: "run-reemit", text: "Second question", uuid: "u-2" },
+        {
+          type: "message_complete",
+          run_id: "run-reemit",
+          message_id: "m-2",
+          text: "Second answer",
+        },
+      ] as BusEvent[];
+      store.applyEventBatch(events, { replayOnly: true });
+
+      // Re-emitted user turns are deduped by uuid; assistants dedup by message_id.
+      expect(store.timeline.filter((e) => e.kind === "user")).toHaveLength(2);
+      expect(store.timeline.filter((e) => e.kind === "assistant")).toHaveLength(2);
+      // Correctly interleaved — no orphaned "You" turns piled at the end.
+      expect(store.timeline.map((e) => e.kind)).toEqual(["user", "assistant", "user", "assistant"]);
+    });
+
+    it("keeps a genuine repeat of the same text (different uuid)", () => {
+      store.run = makeRun("run-repeat");
+      store.phase = "running";
+      const events = [
+        { type: "user_message", run_id: "run-repeat", text: "same text", uuid: "u-a" },
+        { type: "message_complete", run_id: "run-repeat", message_id: "m-a", text: "answer a" },
+        // Legitimate resend of identical text in a later turn — DIFFERENT uuid.
+        { type: "user_message", run_id: "run-repeat", text: "same text", uuid: "u-b" },
+        { type: "message_complete", run_id: "run-repeat", message_id: "m-b", text: "answer b" },
+      ] as BusEvent[];
+      store.applyEventBatch(events, { replayOnly: true });
+      expect(store.timeline.filter((e) => e.kind === "user")).toHaveLength(2);
+    });
   });
 
   // ── applyEvent (single live event) ──
