@@ -808,18 +808,19 @@ pub(crate) fn build_imported_index() -> ImportedIndex {
             let meta_path = entry.path().join("meta.json");
             if let Ok(content) = fs::read_to_string(&meta_path) {
                 if let Ok(meta) = serde_json::from_str::<RunMeta>(&content) {
-                    if meta.source == Some(RunSource::CliImport) {
-                        if let Some(ref sid) = meta.session_id {
-                            let cwd_key = if meta.agent == "codex" {
-                                String::new()
-                            } else {
-                                meta.cwd.clone()
-                            };
-                            index.insert(
-                                (meta.agent.clone(), sid.clone(), cwd_key),
-                                meta.id.clone(),
-                            );
-                        }
+                    // Index EVERY run that owns a CLI session_id — not just source=CliImport.
+                    // Sessions CoVibeCode created itself (source=None) also have a session_id
+                    // and a .jsonl on disk; without this they were offered for re-import as if
+                    // they were external CLI sessions. Soft-deleted runs (deleted_at set) are
+                    // intentionally kept in the index too, so a session the user deleted isn't
+                    // silently resurrected by clicking "Import".
+                    if let Some(ref sid) = meta.session_id {
+                        let cwd_key = if meta.agent == "codex" {
+                            String::new()
+                        } else {
+                            meta.cwd.clone()
+                        };
+                        index.insert((meta.agent.clone(), sid.clone(), cwd_key), meta.id.clone());
                     }
                 }
             }
