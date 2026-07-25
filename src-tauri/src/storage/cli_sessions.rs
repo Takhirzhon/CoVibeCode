@@ -800,6 +800,21 @@ fn collect_jsonl_files(dir: &Path, out: &mut Vec<(PathBuf, u64, std::time::Syste
 pub(crate) type ImportedIndexKey = (String, String, String);
 pub(crate) type ImportedIndex = HashMap<ImportedIndexKey, String>;
 
+/// Build the imported-index key for a session. cwd is normalized ONCE here so the
+/// index-build, listing, and import-dedup paths can never key the same session
+/// differently — the root of the Windows backslash-vs-forward-slash bug where a
+/// native run (frontend forward-slash cwd) and its JSONL (backslash cwd) failed to
+/// dedup and the session was offered for re-import. Codex is cwd-agnostic (a thread
+/// is one conversation across cwds), so its cwd component is always empty.
+pub(crate) fn imported_index_key(agent: &str, session_id: &str, cwd: &str) -> ImportedIndexKey {
+    let cwd_key = if agent == "codex" {
+        String::new()
+    } else {
+        normalize_cwd(cwd)
+    };
+    (agent.to_string(), session_id.to_string(), cwd_key)
+}
+
 pub(crate) fn build_imported_index() -> ImportedIndex {
     let mut index = HashMap::new();
     let runs_dir = super::runs_dir();
@@ -815,12 +830,10 @@ pub(crate) fn build_imported_index() -> ImportedIndex {
                     // intentionally kept in the index too, so a session the user deleted isn't
                     // silently resurrected by clicking "Import".
                     if let Some(ref sid) = meta.session_id {
-                        let cwd_key = if meta.agent == "codex" {
-                            String::new()
-                        } else {
-                            meta.cwd.clone()
-                        };
-                        index.insert((meta.agent.clone(), sid.clone(), cwd_key), meta.id.clone());
+                        index.insert(
+                            imported_index_key(&meta.agent, sid, &meta.cwd),
+                            meta.id.clone(),
+                        );
                     }
                 }
             }
@@ -1030,11 +1043,7 @@ fn extract_summary(
         _ => return Ok(None),
     };
 
-    let key = (
-        "claude".to_string(),
-        session_id.clone(),
-        matched_cwd.clone(),
-    );
+    let key = imported_index_key("claude", &session_id, &matched_cwd);
     let (already_imported, existing_run_id) = if let Some(rid) = imported.get(&key) {
         (true, Some(rid.clone()))
     } else {
@@ -1075,13 +1084,9 @@ pub fn import_session(
         cwd
     );
 
-    // 1. Dedup check
+    // 1. Dedup check (imported_index_key normalizes cwd so native/imported/JSONL match)
     let imported = build_imported_index();
-    let key = (
-        "claude".to_string(),
-        session_id.to_string(),
-        cwd.to_string(),
-    );
+    let key = imported_index_key("claude", session_id, cwd);
     if let Some(existing_run_id) = imported.get(&key) {
         return Err(format!(
             "session already imported as run {}",
@@ -1722,6 +1727,31 @@ mod tests {
         );
         assert_eq!(normalize_cwd("/"), "");
         assert_eq!(normalize_cwd(""), "");
+    }
+
+    #[test]
+    fn test_imported_index_key_dedups_across_cwd_separators() {
+        // The recurring import bug: a native run stores its cwd with forward slashes
+        // (from the frontend) while the same session's JSONL / an imported run uses
+        // Windows backslashes. Both MUST produce the same index key, or CoVibeCode's own
+        // (and deleted) sessions get offered for re-import.
+        let native = imported_index_key("claude", "sid-1", "C:/Users/tashmatov/Desktop/Solo/Oqu");
+        let jsonl = imported_index_key(
+            "claude",
+            "sid-1",
+            "C:\\Users\\tashmatov\\Desktop\\Solo\\Oqu",
+        );
+        assert_eq!(native, jsonl);
+        // Lowercase drive letter also normalizes.
+        assert_eq!(
+            imported_index_key("claude", "sid-1", "c:\\Repo"),
+            imported_index_key("claude", "sid-1", "C:/Repo"),
+        );
+        // Codex is cwd-agnostic: same thread across different cwds keys identically.
+        assert_eq!(
+            imported_index_key("codex", "thread-1", "C:/a"),
+            imported_index_key("codex", "thread-1", "/other"),
+        );
     }
 
     #[test]
