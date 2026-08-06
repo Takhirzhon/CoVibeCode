@@ -22,6 +22,7 @@
   import AboutModal from "$lib/components/AboutModal.svelte";
   import PermissionsModal from "$lib/components/PermissionsModal.svelte";
   import Modal from "$lib/components/Modal.svelte";
+  import ImageLightbox from "$lib/components/ImageLightbox.svelte";
   import CliSessionBrowser from "$lib/components/CliSessionBrowser.svelte";
   import UpdateBanner from "$lib/components/UpdateBanner.svelte";
   import FolderPicker from "$lib/components/FolderPicker.svelte";
@@ -2515,6 +2516,8 @@
 {#if showSetupWizard}
   <SetupWizard onComplete={handleSetupComplete} />
 {/if}
+
+<ImageLightbox />
 
 <AboutModal bind:open={showAbout} />
 
