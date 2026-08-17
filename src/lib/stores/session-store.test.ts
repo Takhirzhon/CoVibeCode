@@ -5,14 +5,20 @@
  * event fixtures derived from real ~/.opencovibe/runs/ data.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import type { BusEvent, TimelineEntry } from "$lib/types";
+import type { BusEvent, HistoryEntry, TimelineEntry } from "$lib/types";
 import { assertTransition, canResumeRun, getResumeWarning, classifyError } from "./types";
 
 // Mock Tauri API — the store imports api.ts which calls invoke()
 vi.mock("$lib/api", () => ({
   getRun: vi.fn(),
   getBusEvents: vi.fn(),
+  getBusEventsPage: vi
+    .fn()
+    .mockResolvedValue({ events: [], lastSeq: 0, hasMore: false, nextOffset: 0 }),
   getRunEvents: vi.fn(),
+  getHistorySummary: vi.fn(),
+  getHistoryPage: vi.fn(),
+  forkSession: vi.fn(),
   startRun: vi.fn(),
   startSession: vi.fn(),
   sendSessionMessage: vi.fn(),
@@ -20,6 +26,7 @@ vi.mock("$lib/api", () => ({
   stopSession: vi.fn(),
   stopRun: vi.fn(),
   sendSessionControl: vi.fn(),
+  respondUserInput: vi.fn(),
   steerSession: vi.fn(),
   syncCliSession: vi.fn().mockResolvedValue({ newEvents: 0 }),
   renameRun: vi.fn().mockResolvedValue(undefined),
@@ -80,6 +87,63 @@ function makeRun(id: string, overrides: Record<string, unknown> = {}) {
     execution_path: "session_actor" as const,
     ...overrides,
   };
+}
+
+function makeHistory(runId: string, pageCount = 1) {
+  const generationId = `gen-${runId}`;
+  const summary = {
+    runId,
+    generationId,
+    pageCount,
+    totalEntries: pageCount > 0 ? 2 : 0,
+    totalTurns: pageCount > 0 ? 1 : 0,
+    lastSeq: pageCount > 0 ? 4 : 0,
+    sourceSize: 100,
+    sourceMtimeNs: 1,
+    latestCursor: pageCount > 0 ? `${generationId}:${pageCount}` : undefined,
+    stateEvents: [],
+  };
+  const entries: HistoryEntry[] = [
+    {
+      kind: "user",
+      id: "u1",
+      anchorId: "u1",
+      ts: "t1",
+      content: {
+        preview: "Hello",
+        byteLength: 5,
+        truncated: false,
+        encoding: "text",
+      },
+      firstSeq: 1,
+      lastSeq: 1,
+    },
+    {
+      kind: "assistant",
+      id: "a1",
+      anchorId: "a1",
+      ts: "t2",
+      content: {
+        preview: "Hi there!",
+        byteLength: 9,
+        truncated: false,
+        encoding: "text",
+      },
+      firstSeq: 2,
+      lastSeq: 4,
+    },
+  ];
+  const page = {
+    runId,
+    generationId,
+    entries,
+    pageCursor: `${generationId}:${pageCount}`,
+    previousCursor: pageCount > 1 ? `${generationId}:${pageCount}` : undefined,
+    hasMore: pageCount > 1,
+    firstSeq: 1,
+    lastSeq: 4,
+  };
+  return { summary, page };
 }
 
 describe("SessionStore reducer", () => {
@@ -408,6 +472,40 @@ describe("SessionStore reducer", () => {
       const users = store.timeline.filter((e) => e.kind === "user");
       expect(users).toHaveLength(2); // "Create a file" + "app.js"
       expect(users[1].content).toBe("app.js");
+    });
+
+    it("keeps a Codex question retryable when durable response start fails", async () => {
+      store = new SessionStore();
+      store.run = makeRun("run-codex-question", { agent: "codex" });
+      store.phase = "running";
+      store.applyEventBatch([
+        {
+          type: "tool_start",
+          run_id: "run-codex-question",
+          tool_use_id: "question-1",
+          tool_name: "AskUserQuestion",
+          input: { questions: [{ id: "choice", question: "Choose" }] },
+        },
+        {
+          type: "tool_end",
+          run_id: "run-codex-question",
+          tool_use_id: "question-1",
+          tool_name: "AskUserQuestion",
+          output: {},
+          status: "error",
+        },
+      ]);
+      vi.mocked(api.respondUserInput).mockRejectedValueOnce(
+        new Error("[interaction:not_started] persist started failed"),
+      );
+
+      await expect(store.answerToolQuestion("question-1", "A")).rejects.toThrow(
+        "persist started failed",
+      );
+      const toolEntry = store.timeline.find(
+        (entry) => entry.kind === "tool" && entry.id === "question-1",
+      ) as Extract<TimelineEntry, { kind: "tool" }>;
+      expect(toolEntry.tool.status).toBe("ask_pending");
     });
   });
 
@@ -988,6 +1086,50 @@ describe("SessionStore reducer", () => {
       ) as Extract<TimelineEntry, { kind: "tool" }>;
       expect(bashInSub).toBeDefined();
       expect(bashInSub.tool.status).toBe("permission_denied");
+    });
+
+    it("tool_end with missing parent_tool_use_id closes the matching nested tool", () => {
+      const events: BusEvent[] = [
+        {
+          type: "tool_start",
+          run_id: "run-tool-end-fallback",
+          tool_use_id: "task-parent",
+          tool_name: "Task",
+          input: {},
+        },
+        {
+          type: "tool_start",
+          run_id: "run-tool-end-fallback",
+          parent_tool_use_id: "task-parent",
+          tool_use_id: "bash-child",
+          tool_name: "Bash",
+          input: { command: "pwd" },
+        },
+        {
+          type: "tool_end",
+          run_id: "run-tool-end-fallback",
+          tool_use_id: "bash-child",
+          tool_name: "Bash",
+          status: "success",
+          output: { stdout: "/tmp" },
+        },
+      ];
+
+      store.run = makeRun("run-tool-end-fallback", { status: "running" });
+      store.phase = "running";
+      store.applyEventBatch(events, { replayOnly: false });
+
+      expect(
+        store.timeline.some((entry) => entry.kind === "tool" && entry.id === "bash-child"),
+      ).toBe(false);
+      const parent = store.timeline.find(
+        (entry) => entry.kind === "tool" && entry.id === "task-parent",
+      ) as Extract<TimelineEntry, { kind: "tool" }>;
+      expect(parent.subTimeline?.[0]).toMatchObject({
+        kind: "tool",
+        id: "bash-child",
+        tool: { status: "success", output: { stdout: "/tmp" } },
+      });
     });
   });
 
@@ -1797,6 +1939,121 @@ describe("SessionStore reducer", () => {
       expect(agents[0].thread_id).toBe("t2");
       expect(agents[0].status).toBe("completed");
     });
+
+    it("stores resolved Codex agent identities", () => {
+      store.run = makeRun("run-collab");
+      store.applyEvent({
+        type: "codex_agent_info",
+        run_id: "run-collab",
+        thread_id: "child-1",
+        nickname: "Dewey",
+        role: "explorer",
+        parent_thread_id: "root",
+      });
+
+      expect(store.codexAgentInfo["child-1"]).toEqual({
+        nickname: "Dewey",
+        role: "explorer",
+        parentThreadId: "root",
+      });
+      expect(store.unknownEventCount).toBe(0);
+    });
+
+    it("commits Codex agent identities through batch reduction", () => {
+      store.run = makeRun("run-collab");
+      store.applyEventBatch([
+        {
+          type: "codex_agent_info",
+          run_id: "run-collab",
+          thread_id: "child-batch",
+          nickname: "Huey",
+          role: "worker",
+          parent_thread_id: "root",
+        },
+      ]);
+
+      expect(store.codexAgentInfo["child-batch"]).toEqual({
+        nickname: "Huey",
+        role: "worker",
+        parentThreadId: "root",
+      });
+    });
+
+    it("does not publish Codex identities from a stale async batch", async () => {
+      store.run = makeRun("run-collab");
+      store.codexAgentInfo = {
+        existing: { nickname: "Live", role: "worker", parentThreadId: "root" },
+      };
+      const events: BusEvent[] = Array.from({ length: 501 }, (_, index) =>
+        index === 0
+          ? {
+              type: "codex_agent_info",
+              run_id: "run-collab",
+              thread_id: "stale-child",
+              nickname: "Stale",
+            }
+          : {
+              type: "message_delta",
+              run_id: "run-collab",
+              text: "x",
+            },
+      );
+      let staleChecks = 0;
+
+      const result = await store.applyEventBatchAsync(events, {
+        isStale: () => ++staleChecks >= 3,
+      });
+
+      expect(result).toBeNull();
+      expect(store.codexAgentInfo).toEqual({
+        existing: { nickname: "Live", role: "worker", parentThreadId: "root" },
+      });
+    });
+
+    it("preserves a live Codex identity that arrives while async replay yields", async () => {
+      store.run = makeRun("run-collab");
+      const events: BusEvent[] = Array.from({ length: 501 }, (_, index) =>
+        index === 0
+          ? {
+              type: "codex_agent_info",
+              run_id: "run-collab",
+              thread_id: "child-1",
+              nickname: "Historical",
+            }
+          : { type: "message_delta", run_id: "run-collab", text: "x" },
+      );
+
+      const replay = store.applyEventBatchAsync(events);
+      store.applyEvent({
+        type: "codex_agent_info",
+        run_id: "run-collab",
+        thread_id: "child-1",
+        nickname: "Live",
+      });
+      await replay;
+
+      expect(store.codexAgentInfo["child-1"]?.nickname).toBe("Live");
+    });
+
+    it("snapshot round-trip preserves resolved Codex identities", () => {
+      store.run = makeRun("run-collab");
+      store.applyEvent({
+        type: "codex_agent_info",
+        run_id: "run-collab",
+        thread_id: "child-1",
+        nickname: "Dewey",
+        parent_thread_id: "root",
+      });
+
+      const body = (store as unknown as { _buildSnapshot(): string })._buildSnapshot();
+      const fresh = new SessionStore();
+      const restored = (
+        fresh as unknown as { _tryApplySnapshot(body: string): boolean }
+      )._tryApplySnapshot(body);
+
+      expect(restored).toBe(true);
+      expect(fresh.codexAgentInfo["child-1"]?.nickname).toBe("Dewey");
+    });
   });
 
   // ── Subagent streaming deltas ──
@@ -2209,6 +2466,369 @@ describe("SessionStore reducer", () => {
     });
   });
 
+  describe("interaction_resolved", () => {
+    it("treats a started or failed response as non-retryable during recovery", () => {
+      store.run = makeRun("run-1");
+      store.phase = "running";
+      store.applyEventBatch([
+        {
+          type: "elicitation_prompt",
+          run_id: "run-1",
+          request_id: "req-uncertain",
+          mcp_server_name: "server",
+          message: "Choose",
+        },
+        {
+          type: "interaction_response_started",
+          run_id: "run-1",
+          request_id: "req-uncertain",
+          interaction_kind: "elicitation",
+          resolution: "accept",
+        },
+      ]);
+      expect(store.pendingElicitations.get("req-uncertain")?.responseStatus).toBe("responding");
+    });
+
+    it("shows explicit terminal failures for permission, hook, and elicitation", () => {
+      store.run = makeRun("run-1");
+      store.phase = "running";
+      store.applyEventBatch([
+        {
+          type: "tool_start",
+          run_id: "run-1",
+          tool_use_id: "tool-perm",
+          tool_name: "Bash",
+          input: {},
+        },
+        {
+          type: "permission_prompt",
+          run_id: "run-1",
+          request_id: "req-perm",
+          tool_name: "Bash",
+          tool_use_id: "tool-perm",
+          tool_input: {},
+          decision_reason: "confirm",
+        },
+        {
+          type: "hook_callback",
+          run_id: "run-1",
+          request_id: "req-hook",
+          hook_event: "PreToolUse",
+          hook_id: "hook-1",
+          data: {},
+        },
+        {
+          type: "elicitation_prompt",
+          run_id: "run-1",
+          request_id: "req-elicit",
+          mcp_server_name: "server",
+          message: "Choose",
+        },
+        ...["req-perm", "req-hook", "req-elicit"].map((request_id, index) => ({
+          type: "interaction_response_failed" as const,
+          run_id: "run-1",
+          request_id,
+          interaction_kind: ["permission", "hook", "elicitation"][index] as
+            | "permission"
+            | "hook"
+            | "elicitation",
+          error: "flush failed",
+        })),
+      ]);
+
+      const permission = store.timeline.find(
+        (entry) => entry.kind === "tool" && entry.id === "tool-perm",
+      ) as Extract<TimelineEntry, { kind: "tool" }>;
+      expect(permission.tool.status).toBe("response_failed");
+      expect(store.hookEvents.find((hook) => hook.request_id === "req-hook")?.status).toBe("error");
+      expect(store.pendingElicitations.get("req-elicit")?.responseStatus).toBe("error");
+      expect(store.hasElicitation).toBe(false);
+    });
+
+    it("converges a Codex request_user_input card restored before catch-up", () => {
+      store.run = makeRun("run-1", { agent: "codex" });
+      store.phase = "running";
+      store.applyEventBatch([
+        {
+          type: "tool_start",
+          run_id: "run-1",
+          tool_use_id: "req-question-1",
+          tool_name: "AskUserQuestion",
+          input: { questions: [{ id: "choice", question: "Choose" }] },
+        },
+        {
+          type: "tool_end",
+          run_id: "run-1",
+          tool_use_id: "req-question-1",
+          tool_name: "AskUserQuestion",
+          output: {},
+          status: "error",
+        },
+        {
+          type: "interaction_response_started",
+          run_id: "run-1",
+          request_id: "req-question-1",
+          interaction_kind: "user_input",
+        },
+      ]);
+
+      const toolEntry = store.timeline.find(
+        (entry) => entry.kind === "tool" && entry.id === "req-question-1",
+      ) as Extract<TimelineEntry, { kind: "tool" }>;
+      expect(toolEntry.tool.status).toBe("response_pending");
+      expect(store.hasInlinePermission).toBe(false);
+    });
+
+    it("shows a terminal error when a Codex user-input response write fails", () => {
+      store.run = makeRun("run-1", { agent: "codex" });
+      store.phase = "running";
+      store.applyEventBatch([
+        {
+          type: "tool_start",
+          run_id: "run-1",
+          tool_use_id: "req-question-1",
+          tool_name: "AskUserQuestion",
+          input: { questions: [] },
+        },
+        {
+          type: "tool_end",
+          run_id: "run-1",
+          tool_use_id: "req-question-1",
+          tool_name: "AskUserQuestion",
+          output: {},
+          status: "error",
+        },
+        {
+          type: "interaction_response_started",
+          run_id: "run-1",
+          request_id: "req-question-1",
+          interaction_kind: "user_input",
+        },
+        {
+          type: "interaction_response_failed",
+          run_id: "run-1",
+          request_id: "req-question-1",
+          interaction_kind: "user_input",
+          error: "CLI stdin closed",
+        },
+      ]);
+
+      const toolEntry = store.timeline.find(
+        (entry) => entry.kind === "tool" && entry.id === "req-question-1",
+      ) as Extract<TimelineEntry, { kind: "tool" }>;
+      expect(toolEntry.tool.status).toBe("response_failed");
+    });
+
+    it("converges a permission prompt restored before catch-up", () => {
+      store.run = makeRun("run-1");
+      store.phase = "running";
+      store.applyEventBatch([
+        {
+          type: "tool_start",
+          run_id: "run-1",
+          tool_use_id: "tool-perm-1",
+          tool_name: "Bash",
+          input: { command: "npm test" },
+        },
+        {
+          type: "permission_prompt",
+          run_id: "run-1",
+          request_id: "req-perm-1",
+          tool_name: "Bash",
+          tool_use_id: "tool-perm-1",
+          tool_input: { command: "npm test" },
+          decision_reason: "requires approval",
+        },
+        {
+          type: "interaction_resolved",
+          run_id: "run-1",
+          request_id: "req-perm-1",
+          interaction_kind: "permission",
+          resolution: "allow",
+        },
+      ]);
+
+      const toolEntry = store.timeline.find(
+        (entry) => entry.kind === "tool" && entry.id === "tool-perm-1",
+      ) as Extract<TimelineEntry, { kind: "tool" }>;
+      expect(toolEntry.tool.status).toBe("running");
+      expect(store.hasPendingPermission).toBe(false);
+    });
+
+    it("converges pending elicitation and hook cards restored before catch-up", () => {
+      store.run = makeRun("run-1");
+      store.phase = "running";
+      store.applyEventBatch([
+        {
+          type: "elicitation_prompt",
+          run_id: "run-1",
+          request_id: "req-elicit-1",
+          mcp_server_name: "github-mcp",
+          message: "Please authenticate",
+        },
+        {
+          type: "hook_callback",
+          run_id: "run-1",
+          request_id: "req-hook-1",
+          hook_event: "PreToolUse",
+          hook_id: "hook-1",
+          data: { tool_name: "Bash" },
+        },
+        {
+          type: "interaction_resolved",
+          run_id: "run-1",
+          request_id: "req-elicit-1",
+          interaction_kind: "elicitation",
+          resolution: "accept",
+        },
+        {
+          type: "interaction_resolved",
+          run_id: "run-1",
+          request_id: "req-hook-1",
+          interaction_kind: "hook",
+          resolution: "deny",
+        },
+      ]);
+
+      expect(store.pendingElicitations.has("req-elicit-1")).toBe(false);
+      expect(store.hookEvents.find((hook) => hook.request_id === "req-hook-1")?.status).toBe(
+        "denied",
+      );
+    });
+
+    it("converges all response_started cards when cancellation is replayed", () => {
+      store.run = makeRun("run-1");
+      store.phase = "running";
+      store.applyEventBatch([
+        {
+          type: "tool_start",
+          run_id: "run-1",
+          tool_use_id: "tool-permission",
+          tool_name: "Bash",
+          input: {},
+        },
+        {
+          type: "permission_prompt",
+          run_id: "run-1",
+          request_id: "request-permission",
+          tool_name: "Bash",
+          tool_use_id: "tool-permission",
+          tool_input: {},
+          decision_reason: "confirm",
+        },
+        {
+          type: "hook_callback",
+          run_id: "run-1",
+          request_id: "request-hook",
+          hook_event: "PreToolUse",
+          hook_id: "hook-1",
+          data: {},
+        },
+        {
+          type: "elicitation_prompt",
+          run_id: "run-1",
+          request_id: "request-elicitation",
+          mcp_server_name: "server",
+          message: "Choose",
+        },
+        {
+          type: "tool_start",
+          run_id: "run-1",
+          tool_use_id: "request-user-input",
+          tool_name: "AskUserQuestion",
+          input: { questions: [] },
+        },
+        {
+          type: "tool_end",
+          run_id: "run-1",
+          tool_use_id: "request-user-input",
+          tool_name: "AskUserQuestion",
+          output: {},
+          status: "error",
+        },
+        ...[
+          ["request-permission", "permission"],
+          ["request-hook", "hook"],
+          ["request-elicitation", "elicitation"],
+          ["request-user-input", "user_input"],
+        ].flatMap(([request_id, interaction_kind]) => [
+          {
+            type: "interaction_response_started" as const,
+            run_id: "run-1",
+            request_id,
+            interaction_kind: interaction_kind as
+              | "permission"
+              | "hook"
+              | "elicitation"
+              | "user_input",
+          },
+          { type: "control_cancelled" as const, run_id: "run-1", request_id },
+        ]),
+      ]);
+
+      const permission = store.timeline.find(
+        (entry) => entry.kind === "tool" && entry.id === "tool-permission",
+      ) as Extract<TimelineEntry, { kind: "tool" }>;
+      const userInput = store.timeline.find(
+        (entry) => entry.kind === "tool" && entry.id === "request-user-input",
+      ) as Extract<TimelineEntry, { kind: "tool" }>;
+      expect(permission.tool.status).toBe("error");
+      expect(userInput.tool.status).toBe("error");
+      expect(store.hookEvents.find((hook) => hook.request_id === "request-hook")?.status).toBe(
+        "cancelled",
+      );
+      expect(store.pendingElicitations.has("request-elicitation")).toBe(false);
+    });
+
+    it("legacy events without resolution still remove every matching pending card", () => {
+      store.run = makeRun("run-1");
+      store.phase = "running";
+      store.applyEventBatch([
+        {
+          type: "tool_start",
+          run_id: "run-1",
+          tool_use_id: "tool-legacy",
+          tool_name: "Bash",
+          input: {},
+        },
+        {
+          type: "permission_prompt",
+          run_id: "run-1",
+          request_id: "req-legacy",
+          tool_name: "Bash",
+          tool_use_id: "tool-legacy",
+          tool_input: {},
+          decision_reason: "Legacy prompt",
+        },
+        {
+          type: "elicitation_prompt",
+          run_id: "run-1",
+          request_id: "req-legacy",
+          mcp_server_name: "legacy-mcp",
+          message: "Legacy prompt",
+        },
+        {
+          type: "hook_callback",
+          run_id: "run-1",
+          request_id: "req-legacy",
+          hook_event: "PreToolUse",
+          hook_id: "hook-legacy",
+          data: {},
+        },
+        { type: "interaction_resolved", run_id: "run-1", request_id: "req-legacy" },
+      ]);
+
+      expect(store.pendingElicitations.has("req-legacy")).toBe(false);
+      const toolEntry = store.timeline.find(
+        (entry) => entry.kind === "tool" && entry.id === "tool-legacy",
+      ) as Extract<TimelineEntry, { kind: "tool" }>;
+      expect(toolEntry.tool.status).toBe("running");
+      expect(store.hookEvents.find((hook) => hook.request_id === "req-legacy")?.status).toBe(
+        "resolved",
+      );
+    });
+  });
+
   describe("ralph_loop events", () => {
     it("ralph_started initializes ralphLoop state", () => {
       store.run = makeRun("run-1");
@@ -2601,7 +3221,7 @@ describe("SessionStore reducer", () => {
           run_id: "run-1",
           tool_use_id: "tool-1",
           tool_name: "Bash",
-          input: { command: "npm test" },
+          input: { command: "npm test", description: "stale input" },
         },
         {
           type: "permission_prompt",
@@ -2609,7 +3229,7 @@ describe("SessionStore reducer", () => {
           request_id: "req-1",
           tool_name: "Bash",
           tool_use_id: "tool-1",
-          tool_input: { command: "npm test" },
+          tool_input: { command: "npm test -- --run", cwd: "/project" },
           decision_reason: "needs approval",
           suggestions: [{ type: "addRules", rules: ["Bash(npm test)"], behavior: "allow" }],
         },
@@ -2620,9 +3240,53 @@ describe("SessionStore reducer", () => {
         { kind: "tool" }
       >;
       expect(entry.tool.status).toBe("permission_prompt");
+      expect(entry.tool.input).toEqual({ command: "npm test -- --run", cwd: "/project" });
+      expect(entry.tool.permission_reason).toBe("needs approval");
       expect(entry.tool.suggestions).toEqual([
         { type: "addRules", rules: ["Bash(npm test)"], behavior: "allow" },
       ]);
+    });
+
+    it("a later permission_prompt clears stale suggestions", () => {
+      store.run = makeRun("run-1");
+      store.phase = "running";
+      store.applyEventBatch([
+        {
+          type: "tool_start",
+          run_id: "run-1",
+          tool_use_id: "tool-1",
+          tool_name: "Bash",
+          input: { command: "npm test" },
+        },
+        {
+          type: "permission_prompt",
+          run_id: "run-1",
+          request_id: "req-1",
+          tool_name: "Bash",
+          tool_use_id: "tool-1",
+          tool_input: { command: "npm test" },
+          decision_reason: "first request",
+          suggestions: [{ type: "addRules", rules: ["Bash(npm test)"], behavior: "allow" }],
+        },
+        {
+          type: "permission_prompt",
+          run_id: "run-1",
+          request_id: "req-2",
+          tool_name: "Bash",
+          tool_use_id: "tool-1",
+          tool_input: { command: "npm test -- --run" },
+          decision_reason: "second request",
+        },
+      ] as BusEvent[]);
+
+      const entry = store.timeline.find((e) => e.kind === "tool" && e.id === "tool-1") as Extract<
+        TimelineEntry,
+        { kind: "tool" }
+      >;
+      expect(entry.tool.permission_request_id).toBe("req-2");
+      expect(entry.tool.permission_reason).toBe("second request");
+      expect(entry.tool.input).toEqual({ command: "npm test -- --run" });
+      expect(entry.tool.suggestions).toEqual([]);
     });
 
     it("permission_prompt merges suggestions in subTimeline (fallback path)", () => {
@@ -2676,6 +3340,26 @@ describe("SessionStore reducer", () => {
       expect(bashInSub.tool.suggestions).toEqual([
         { type: "addRules", rules: ["Bash(rm -rf /)"], behavior: "allow" },
       ]);
+
+      store.applyEvent({
+        type: "permission_prompt",
+        run_id: "run-8",
+        tool_use_id: "bash-child",
+        tool_name: "Bash",
+        tool_input: { command: "rm -rf /tmp/cache" },
+        request_id: "req-2",
+        decision_reason: "second request",
+      } as BusEvent);
+      const updatedTask = store.timeline.find(
+        (e) => e.kind === "tool" && e.id === "task-parent",
+      ) as Extract<TimelineEntry, { kind: "tool" }>;
+      const updatedBash = updatedTask.subTimeline!.find(
+        (e) => e.kind === "tool" && e.id === "bash-child",
+      ) as Extract<TimelineEntry, { kind: "tool" }>;
+      expect(updatedBash.tool.input).toEqual({ command: "rm -rf /tmp/cache" });
+      expect(updatedBash.tool.permission_request_id).toBe("req-2");
+      expect(updatedBash.tool.permission_reason).toBe("second request");
+      expect(updatedBash.tool.suggestions).toEqual([]);
     });
 
     it("run_state idle resolves stale permission_prompt to error", () => {
@@ -2714,7 +3398,7 @@ describe("SessionStore reducer", () => {
   });
 
   describe("resolvePermissionAllow", () => {
-    it("switches permission_prompt to running, preserves permission_request_id", () => {
+    it("keeps an approved executable tool running and preserves permission_request_id", () => {
       store.run = makeRun("run-1");
       store.phase = "running";
       const events: BusEvent[] = [
@@ -2750,6 +3434,43 @@ describe("SessionStore reducer", () => {
       >;
       expect(after.tool.status).toBe("running");
       expect(after.tool.permission_request_id).toBe("req-1");
+    });
+
+    it("completes RequestPermissions on allow and keeps it successful after idle", () => {
+      store.run = makeRun("run-1");
+      store.phase = "running";
+      store.applyEventBatch([
+        {
+          type: "tool_start",
+          run_id: "run-1",
+          tool_use_id: "permissions-1",
+          tool_name: "RequestPermissions",
+          input: { permissions: { network: { enabled: true } }, cwd: "/project" },
+        },
+        {
+          type: "permission_prompt",
+          run_id: "run-1",
+          request_id: "req-permissions",
+          tool_name: "RequestPermissions",
+          tool_use_id: "permissions-1",
+          tool_input: { permissions: { network: { enabled: true } }, cwd: "/project" },
+          decision_reason: "Needs network access",
+        },
+      ] as BusEvent[]);
+
+      store.resolvePermissionAllow("req-permissions");
+
+      let entry = store.timeline.find(
+        (candidate) => candidate.kind === "tool" && candidate.id === "permissions-1",
+      ) as Extract<TimelineEntry, { kind: "tool" }>;
+      expect(entry.tool.status).toBe("success");
+
+      store.applyEvent({ type: "run_state", run_id: "run-1", state: "idle" } as BusEvent);
+
+      entry = store.timeline.find(
+        (candidate) => candidate.kind === "tool" && candidate.id === "permissions-1",
+      ) as Extract<TimelineEntry, { kind: "tool" }>;
+      expect(entry.tool.status).toBe("success");
     });
 
     it("skips AskUserQuestion tools", () => {
@@ -2825,6 +3546,46 @@ describe("SessionStore reducer", () => {
       ) as Extract<TimelineEntry, { kind: "tool" }>;
       expect(child.tool.status).toBe("running");
       expect(child.tool.permission_request_id).toBe("req-sub");
+    });
+
+    it("completes RequestPermissions in a subTimeline", () => {
+      store.run = makeRun("run-1");
+      store.phase = "running";
+      store.timeline = [
+        {
+          kind: "tool",
+          id: "task-parent",
+          anchorId: "task-parent",
+          ts: new Date().toISOString(),
+          tool: {
+            tool_use_id: "task-parent",
+            tool_name: "Task",
+            status: "running",
+            input: {},
+          },
+          subTimeline: [
+            {
+              kind: "tool",
+              id: "permissions-child",
+              anchorId: "permissions-child",
+              ts: new Date().toISOString(),
+              tool: {
+                tool_use_id: "permissions-child",
+                tool_name: "RequestPermissions",
+                status: "permission_prompt",
+                permission_request_id: "req-permissions-sub",
+                input: { permissions: { network: { enabled: true } } },
+              },
+            },
+          ],
+        },
+      ] as TimelineEntry[];
+
+      store.resolvePermissionAllow("req-permissions-sub");
+
+      const parent = store.timeline[0] as Extract<TimelineEntry, { kind: "tool" }>;
+      const child = parent.subTimeline![0] as Extract<TimelineEntry, { kind: "tool" }>;
+      expect(child.tool.status).toBe("success");
     });
 
     it("skips AskUserQuestion in subTimeline", () => {
@@ -4249,6 +5010,9 @@ describe("SessionStore reducer", () => {
     const mockDeleteSnapshot = snapshotCache.deleteSnapshot as ReturnType<typeof vi.fn>;
     const mockGetRun = api.getRun as ReturnType<typeof vi.fn>;
     const mockGetBusEvents = api.getBusEvents as ReturnType<typeof vi.fn>;
+    const mockGetBusEventsPage = api.getBusEventsPage as ReturnType<typeof vi.fn>;
+    const mockGetHistorySummary = api.getHistorySummary as ReturnType<typeof vi.fn>;
+    const mockGetHistoryPage = api.getHistoryPage as ReturnType<typeof vi.fn>;
 
     beforeEach(() => {
       mockReadSnapshot.mockReset().mockResolvedValue(null);
@@ -4256,6 +5020,18 @@ describe("SessionStore reducer", () => {
       mockDeleteSnapshot.mockReset().mockResolvedValue(undefined);
       mockGetRun.mockReset();
       mockGetBusEvents.mockReset().mockResolvedValue([]);
+      mockGetBusEventsPage.mockReset().mockResolvedValue({
+        events: [],
+        lastSeq: 0,
+        hasMore: false,
+        nextOffset: 0,
+      });
+      mockGetHistorySummary.mockReset().mockImplementation(async (runId: string) => {
+        return makeHistory(runId).summary;
+      });
+      mockGetHistoryPage.mockReset().mockImplementation(async (runId: string) => {
+        return makeHistory(runId).page;
+      });
     });
 
     describe("snapshot hit vs miss deep comparison", () => {
@@ -4380,150 +5156,847 @@ describe("SessionStore reducer", () => {
       });
     });
 
-    describe("loadRun snapshot paths", () => {
-      it("uses snapshot on hit for terminal stream session", async () => {
+    describe("loadRun paged history", () => {
+      it("ignores a legacy snapshot and loads only the latest page", async () => {
         const termRun = makeRun("run-snap-1", { status: "completed", agent: "claude" });
         mockGetRun.mockResolvedValue(termRun);
-
-        // Build snapshot body from a real replay
-        const refStore = new SessionStore();
-        refStore.run = termRun;
-        refStore.phase = "completed";
-        refStore.applyEventBatch(simpleChatEvents as BusEvent[], { replayOnly: true });
-        const snapBody = (refStore as unknown as { _buildSnapshot(): string })._buildSnapshot();
-
-        mockReadSnapshot.mockResolvedValue(snapBody);
+        mockReadSnapshot.mockResolvedValue("legacy full timeline");
 
         const testStore = new SessionStore();
         await testStore.loadRun("run-snap-1");
 
-        // Should have used snapshot (readSnapshot called, getBusEvents NOT called)
-        expect(mockReadSnapshot).toHaveBeenCalledWith("run-snap-1", "completed");
+        expect(mockReadSnapshot).not.toHaveBeenCalled();
+        expect(mockDeleteSnapshot).toHaveBeenCalledWith("run-snap-1");
+        expect(mockGetHistorySummary).toHaveBeenCalledWith("run-snap-1");
+        expect(mockGetHistoryPage).toHaveBeenCalledWith("run-snap-1", "gen-run-snap-1");
         expect(mockGetBusEvents).not.toHaveBeenCalled();
-        // Timeline should match
-        expect(testStore.timeline).toEqual(refStore.timeline);
+        expect(testStore.timeline.map((entry) => entry.kind)).toEqual(["user", "assistant"]);
+        expect(testStore.numTurns).toBe(1);
         warnSpy.mockClear();
       });
 
-      it("falls back to getBusEvents on snapshot miss", async () => {
-        vi.useFakeTimers();
-        const termRun = makeRun("run-snap-2", { status: "stopped", agent: "claude" });
+      it("does not request a page or write a snapshot for empty history", async () => {
+        const termRun = makeRun("run-empty", { status: "stopped", agent: "claude" });
         mockGetRun.mockResolvedValue(termRun);
-        mockReadSnapshot.mockResolvedValue(null); // miss
-        mockGetBusEvents.mockResolvedValue(simpleChatEvents);
+        mockGetHistorySummary.mockResolvedValue(makeHistory("run-empty", 0).summary);
 
         const testStore = new SessionStore();
-        await testStore.loadRun("run-snap-2");
+        await testStore.loadRun("run-empty");
 
-        expect(mockReadSnapshot).toHaveBeenCalledWith("run-snap-2", "stopped");
-        expect(mockGetBusEvents).toHaveBeenCalledWith("run-snap-2");
-        // Flush deferred _saveSnapshotToIdb (setTimeout(0))
-        vi.advanceTimersByTime(1);
-        // Should have written snapshot after reducer
-        expect(mockWriteSnapshot).toHaveBeenCalled();
-        expect(testStore.timeline.length).toBeGreaterThan(0);
-        vi.useRealTimers();
-        warnSpy.mockClear();
-      });
-
-      it("falls back to getBusEvents on corrupted snapshot", async () => {
-        const termRun = makeRun("run-snap-3", { status: "completed", agent: "claude" });
-        mockGetRun.mockResolvedValue(termRun);
-        mockReadSnapshot.mockResolvedValue("{ invalid json }}}"); // corrupt
-        mockGetBusEvents.mockResolvedValue(simpleChatEvents);
-
-        const testStore = new SessionStore();
-        await testStore.loadRun("run-snap-3");
-
-        // Snapshot read was attempted but failed → fell back to getBusEvents
-        expect(mockReadSnapshot).toHaveBeenCalled();
-        expect(mockGetBusEvents).toHaveBeenCalledWith("run-snap-3");
-        expect(testStore.timeline.length).toBeGreaterThan(0);
-        warnSpy.mockClear();
-      });
-
-      it("falls back to replay when a valid snapshot dropped its assistant turns", async () => {
-        // Regression: a cached snapshot can serialize a timeline that kept the user
-        // turns but lost every assistant turn. It parses/validates fine, so the old
-        // code trusted it and the chat rendered only "You" messages on revisit.
-        const termRun = makeRun("run-snap-4", { status: "completed", agent: "claude" });
-        mockGetRun.mockResolvedValue(termRun);
-
-        // Build a real snapshot, then corrupt it the way the IDB cache did: keep the
-        // user entries, drop the assistant entries (and the dedup set) from the body.
-        const refStore = new SessionStore();
-        refStore.run = termRun;
-        refStore.phase = "completed";
-        refStore.applyEventBatch(simpleChatEvents as BusEvent[], { replayOnly: true });
-        expect(refStore.timeline.some((e) => e.kind === "assistant")).toBe(true);
-
-        const parsed = JSON.parse(
-          (refStore as unknown as { _buildSnapshot(): string })._buildSnapshot(),
-        );
-        parsed.timeline = (parsed.timeline as { kind: string }[]).filter((e) => e.kind === "user");
-        parsed._seenMessageIds = [];
-        expect(parsed.timeline.length).toBeGreaterThan(0);
-
-        mockReadSnapshot.mockResolvedValue(JSON.stringify(parsed));
-        mockGetBusEvents.mockResolvedValue(simpleChatEvents);
-
-        const testStore = new SessionStore();
-        await testStore.loadRun("run-snap-4");
-
-        // Corruption detected → snapshot dropped → full replay from the event log.
-        expect(mockDeleteSnapshot).toHaveBeenCalledWith("run-snap-4");
-        expect(mockGetBusEvents).toHaveBeenCalledWith("run-snap-4");
-        // Assistant turns are restored, and the timeline matches a clean replay
-        // (compare kind + content; `ts` is wall-clock for fixtures without one).
-        const shape = (tl: typeof testStore.timeline) =>
-          tl.map((e) => ({ kind: e.kind, content: (e as { content?: string }).content }));
-        expect(testStore.timeline.some((e) => e.kind === "assistant")).toBe(true);
-        expect(shape(testStore.timeline)).toEqual(shape(refStore.timeline));
-        warnSpy.mockClear();
-      });
-    });
-
-    describe("loadRun write guard", () => {
-      it("does NOT write snapshot when busEvents produce empty timeline (reducer anomaly)", async () => {
-        const termRun = makeRun("run-wg-1", { status: "completed", agent: "claude" });
-        mockGetRun.mockResolvedValue(termRun);
-        mockReadSnapshot.mockResolvedValue(null);
-        // Non-empty busEvents that produce an empty timeline is a reducer anomaly
-        // For this test, we use a single unknown event type that doesn't create timeline entries
-        mockGetBusEvents.mockResolvedValue([
-          { type: "run_state", run_id: "run-wg-1", state: "running" },
-        ]);
-
-        const testStore = new SessionStore();
-        await testStore.loadRun("run-wg-1");
-
-        // Timeline is empty, busEvents was non-empty → should NOT write snapshot
-        expect(testStore.timeline).toHaveLength(0);
+        expect(mockGetHistoryPage).not.toHaveBeenCalled();
         expect(mockWriteSnapshot).not.toHaveBeenCalled();
+        expect(testStore.timeline).toHaveLength(0);
         warnSpy.mockClear();
       });
 
-      it("writes snapshot for legit empty session (0 busEvents)", async () => {
-        vi.useFakeTimers();
-        const termRun = makeRun("run-wg-2", { status: "completed", agent: "claude" });
-        mockGetRun.mockResolvedValue(termRun);
-        mockReadSnapshot.mockResolvedValue(null);
-        mockGetBusEvents.mockResolvedValue([]); // truly empty session
+      it("prepends older pages once and preserves the current phase", async () => {
+        const run = makeRun("run-pages", { status: "completed", agent: "claude" });
+        mockGetRun.mockResolvedValue(run);
+        const latest = makeHistory("run-pages", 2);
+        latest.summary.totalEntries = 3;
+        latest.page.entries = [latest.page.entries[1]];
+        latest.page.firstSeq = 2;
+        mockGetHistorySummary.mockResolvedValue(latest.summary);
+        mockGetHistoryPage.mockResolvedValueOnce(latest.page).mockResolvedValueOnce({
+          ...makeHistory("run-pages").page,
+          entries: [makeHistory("run-pages").page.entries[0]],
+          pageCursor: `${latest.summary.generationId}:1`,
+          previousCursor: undefined,
+          hasMore: false,
+          firstSeq: 1,
+          lastSeq: 1,
+        });
 
         const testStore = new SessionStore();
-        await testStore.loadRun("run-wg-2");
+        await testStore.loadRun("run-pages");
+        expect(testStore.timeline.map((entry) => entry.kind)).toEqual(["assistant"]);
+        const phase = testStore.phase;
+        expect(await testStore.loadOlderHistory()).toBe(true);
+        expect(testStore.timeline.map((entry) => entry.kind)).toEqual(["user", "assistant"]);
+        expect(testStore.phase).toBe(phase);
+        expect(testStore.historyHasMore).toBe(false);
+        expect(await testStore.loadOlderHistory()).toBe(false);
+        expect(mockGetHistoryPage).toHaveBeenCalledTimes(2);
+        warnSpy.mockClear();
+      });
 
-        // Flush deferred _saveSnapshotToIdb (setTimeout(0))
-        vi.advanceTimersByTime(1);
-        // 0 busEvents + 0 timeline → legit empty session → write allowed
-        expect(mockWriteSnapshot).toHaveBeenCalled();
-        vi.useRealTimers();
+      it("coalesces sparse history pages into one bounded prepend batch", async () => {
+        const run = makeRun("run-sparse-pages", { status: "completed", agent: "claude" });
+        const latest = makeHistory(run.id, 15);
+        latest.summary.totalEntries = 15;
+        latest.page.entries = [
+          {
+            ...latest.page.entries[0],
+            id: "page-15",
+            anchorId: "page-15",
+          },
+        ];
+        mockGetRun.mockResolvedValue(run);
+        mockGetHistorySummary.mockResolvedValue(latest.summary);
+        mockGetHistoryPage.mockResolvedValueOnce(latest.page);
+        mockGetHistoryPage.mockImplementation(
+          async (_runId: string, generationId: string, beforeCursor?: string) => {
+            const current = Number(beforeCursor?.split(":").at(-1));
+            const pageNumber = current - 1;
+            return {
+              ...latest.page,
+              generationId,
+              entries: [
+                {
+                  ...latest.page.entries[0],
+                  id: `page-${pageNumber}`,
+                  anchorId: `page-${pageNumber}`,
+                  firstSeq: pageNumber,
+                  lastSeq: pageNumber,
+                },
+              ],
+              pageCursor: `${generationId}:${pageNumber}`,
+              previousCursor: pageNumber > 1 ? `${generationId}:${pageNumber - 1}` : undefined,
+              hasMore: pageNumber > 1,
+            };
+          },
+        );
+
+        const testStore = new SessionStore();
+        await testStore.loadRun(run.id);
+        expect(await testStore.loadOlderHistory()).toBe(true);
+
+        expect(mockGetHistoryPage).toHaveBeenCalledTimes(13);
+        expect(testStore.timeline.map((entry) => entry.id)).toEqual([
+          "page-3",
+          "page-4",
+          "page-5",
+          "page-6",
+          "page-7",
+          "page-8",
+          "page-9",
+          "page-10",
+          "page-11",
+          "page-12",
+          "page-13",
+          "page-14",
+          "page-15",
+        ]);
+        expect(testStore.historyPageCursor).toBe(`${latest.summary.generationId}:3`);
+        expect(testStore.historyHasMore).toBe(true);
+
+        expect(await testStore.loadOlderHistory()).toBe(true);
+        expect(testStore.timeline.map((entry) => entry.id)).toEqual([
+          "page-1",
+          "page-2",
+          "page-3",
+          "page-4",
+          "page-5",
+          "page-6",
+          "page-7",
+          "page-8",
+          "page-9",
+          "page-10",
+          "page-11",
+          "page-12",
+          "page-13",
+          "page-14",
+          "page-15",
+        ]);
+        expect(testStore.historyHasMore).toBe(false);
+        warnSpy.mockClear();
+      });
+
+      it("rejects a non-advancing older history cursor", async () => {
+        const run = makeRun("run-stuck-history-page", { status: "completed" });
+        const latest = makeHistory(run.id, 2);
+        mockGetRun.mockResolvedValue(run);
+        mockGetHistorySummary.mockResolvedValue(latest.summary);
+        mockGetHistoryPage.mockResolvedValueOnce(latest.page).mockResolvedValueOnce({
+          ...latest.page,
+          entries: [],
+          pageCursor: latest.page.pageCursor,
+          hasMore: true,
+        });
+        const testStore = new SessionStore();
+        await testStore.loadRun(run.id);
+
+        await expect(testStore.loadOlderHistory()).rejects.toThrow("cursor did not advance");
+        expect(testStore.timeline).toHaveLength(latest.page.entries.length);
+        expect(testStore.historyLoadingOlder).toBe(false);
+        warnSpy.mockClear();
+      });
+
+      it("deduplicates concurrent older-page requests", async () => {
+        const run = makeRun("run-page-guard", { status: "completed" });
+        const latest = makeHistory(run.id, 2);
+        mockGetRun.mockResolvedValue(run);
+        mockGetHistorySummary.mockResolvedValue(latest.summary);
+        mockGetHistoryPage.mockResolvedValueOnce(latest.page);
+        let resolveOlder!: (value: ReturnType<typeof makeHistory>["page"]) => void;
+        mockGetHistoryPage.mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              resolveOlder = resolve;
+            }),
+        );
+        const testStore = new SessionStore();
+        await testStore.loadRun(run.id);
+
+        const first = testStore.loadOlderHistory();
+        expect(await testStore.loadOlderHistory()).toBe(false);
+        expect(mockGetHistoryPage).toHaveBeenCalledTimes(2);
+        const older = makeHistory(run.id).page;
+        older.entries = [
+          {
+            ...older.entries[0],
+            id: "older-user",
+            anchorId: "older-user",
+          },
+        ];
+        resolveOlder({ ...older, hasMore: false });
+        expect(await first).toBe(true);
+        warnSpy.mockClear();
+      });
+
+      it("maps bounded tool fields and content references", async () => {
+        const run = makeRun("run-tool-history", { status: "completed" });
+        const baseHistory = makeHistory(run.id);
+        const history: {
+          summary: ReturnType<typeof makeHistory>["summary"];
+          page: Omit<ReturnType<typeof makeHistory>["page"], "entries"> & {
+            entries: HistoryEntry[];
+          };
+        } = {
+          summary: baseHistory.summary,
+          page: baseHistory.page,
+        };
+        const contentRef = {
+          preview: "truncated",
+          byteLength: 100_000,
+          truncated: true,
+          contentId: "abcdef",
+          encoding: "json" as const,
+        };
+        history.page.entries = [
+          {
+            kind: "tool",
+            id: "tool-1",
+            anchorId: "tool-1",
+            ts: "t",
+            toolUseId: "tool-1",
+            toolName: "Bash",
+            status: "success",
+            input: { _truncated: true },
+            output: { _truncated: true },
+            inputContent: contentRef,
+            outputContent: contentRef,
+            resultContent: contentRef,
+            subHistoryId: "sub-1",
+            firstSeq: 1,
+            lastSeq: 2,
+          },
+        ];
+        mockGetRun.mockResolvedValue(run);
+        mockGetHistorySummary.mockResolvedValue(history.summary);
+        mockGetHistoryPage.mockResolvedValue(history.page);
+
+        const testStore = new SessionStore();
+        await testStore.loadRun(run.id);
+        const entry = testStore.timeline[0];
+        expect(entry.kind).toBe("tool");
+        if (entry.kind !== "tool") throw new Error("expected tool entry");
+        expect(entry.tool._historyContent).toEqual({
+          input: contentRef,
+          output: contentRef,
+          result: contentRef,
+        });
+        expect(entry.tool._subHistoryId).toBe("sub-1");
+        warnSpy.mockClear();
+      });
+
+      it("loads active catch-up in bounded pages", async () => {
+        const run = makeRun("run-catchup", { status: "running", agent: "claude" });
+        mockGetRun.mockResolvedValue(run);
+        const catchup = api.getBusEventsPage as ReturnType<typeof vi.fn>;
+        catchup
+          .mockResolvedValueOnce({
+            events: [
+              {
+                type: "user_message",
+                run_id: run.id,
+                text: "new question",
+                _seq: 5,
+              },
+            ],
+            lastSeq: 5,
+            hasMore: true,
+            nextOffset: 150,
+          })
+          .mockResolvedValueOnce({
+            events: [
+              {
+                type: "message_complete",
+                run_id: run.id,
+                message_id: "a2",
+                text: "new answer",
+                _seq: 6,
+              },
+            ],
+            lastSeq: 6,
+            hasMore: false,
+            nextOffset: 200,
+          });
+
+        const testStore = new SessionStore();
+        await testStore.loadRun(run.id);
+
+        expect(catchup).toHaveBeenNthCalledWith(1, run.id, 4, 100);
+        expect(catchup).toHaveBeenNthCalledWith(2, run.id, 5, 150);
+        expect(testStore.timeline.slice(-2).map((entry) => entry.kind)).toEqual([
+          "user",
+          "assistant",
+        ]);
+        expect(testStore.phase).toBe("running");
+        warnSpy.mockClear();
+      });
+
+      it("rebuilds the projection when catch-up settles an interrupted turn", async () => {
+        const run = makeRun("run-interrupted-catchup", { status: "idle", agent: "claude" });
+        const initial = makeHistory(run.id);
+        const rebuilt = makeHistory(run.id);
+        rebuilt.summary.generationId = "gen-rebuilt";
+        rebuilt.summary.lastSeq = 6;
+        rebuilt.summary.sourceSize = 180;
+        rebuilt.summary.latestCursor = "gen-rebuilt:1";
+        rebuilt.page.generationId = "gen-rebuilt";
+        rebuilt.page.pageCursor = "gen-rebuilt:1";
+        rebuilt.page.lastSeq = 6;
+        rebuilt.page.entries = [
+          initial.page.entries[0],
+          {
+            kind: "assistant",
+            id: "assistant-incomplete-5",
+            anchorId: "assistant-incomplete-5",
+            ts: "t",
+            content: {
+              preview: "partial answer",
+              byteLength: 14,
+              truncated: false,
+              encoding: "text",
+            },
+            firstSeq: 5,
+            lastSeq: 6,
+          },
+        ];
+        mockGetRun.mockResolvedValue(run);
+        mockGetHistorySummary
+          .mockResolvedValueOnce(initial.summary)
+          .mockResolvedValueOnce(rebuilt.summary);
+        mockGetHistoryPage.mockResolvedValueOnce(initial.page).mockResolvedValueOnce(rebuilt.page);
+        mockGetBusEventsPage
+          .mockResolvedValueOnce({
+            events: [
+              { type: "message_delta", run_id: run.id, text: "partial answer", _seq: 5 },
+              { type: "run_state", run_id: run.id, state: "idle", _seq: 6 },
+            ],
+            lastSeq: 6,
+            hasMore: false,
+            nextOffset: 180,
+          })
+          .mockResolvedValueOnce({
+            events: [],
+            lastSeq: 6,
+            hasMore: false,
+            nextOffset: 180,
+          });
+
+        const testStore = new SessionStore();
+        await testStore.loadRun(run.id);
+
+        expect(mockGetHistorySummary).toHaveBeenNthCalledWith(1, run.id);
+        expect(mockGetHistorySummary).toHaveBeenNthCalledWith(2, run.id, true);
+        expect(mockGetBusEventsPage).toHaveBeenNthCalledWith(1, run.id, 4, 100);
+        expect(mockGetBusEventsPage).toHaveBeenNthCalledWith(2, run.id, 6, 180);
+        expect(testStore.streamingText).toBe("");
+        expect(testStore.timeline.at(-1)).toMatchObject({
+          kind: "assistant",
+          id: "assistant-incomplete-5",
+          content: "partial answer",
+        });
+        warnSpy.mockClear();
+      });
+
+      it("continues bounded semantic rebuilds while checkpoints advance", async () => {
+        const run = makeRun("run-progressing-rebuild", { status: "idle", agent: "claude" });
+        const initial = makeHistory(run.id);
+        const firstRebuild = makeHistory(run.id);
+        firstRebuild.summary.generationId = "gen-progress-1";
+        firstRebuild.summary.lastSeq = 6;
+        firstRebuild.summary.sourceSize = 180;
+        firstRebuild.page.generationId = "gen-progress-1";
+        firstRebuild.page.lastSeq = 6;
+        const secondRebuild = makeHistory(run.id);
+        secondRebuild.summary.generationId = "gen-progress-2";
+        secondRebuild.summary.lastSeq = 8;
+        secondRebuild.summary.sourceSize = 260;
+        secondRebuild.page.generationId = "gen-progress-2";
+        secondRebuild.page.lastSeq = 8;
+        secondRebuild.page.entries.push({
+          kind: "assistant",
+          id: "assistant-incomplete-7",
+          anchorId: "assistant-incomplete-7",
+          ts: "t",
+          content: {
+            preview: "second partial",
+            byteLength: 14,
+            truncated: false,
+            encoding: "text",
+          },
+          firstSeq: 7,
+          lastSeq: 8,
+        });
+        mockGetRun.mockResolvedValue(run);
+        mockGetHistorySummary
+          .mockResolvedValueOnce(initial.summary)
+          .mockResolvedValueOnce(firstRebuild.summary)
+          .mockResolvedValueOnce(secondRebuild.summary);
+        mockGetHistoryPage
+          .mockResolvedValueOnce(initial.page)
+          .mockResolvedValueOnce(firstRebuild.page)
+          .mockResolvedValueOnce(secondRebuild.page);
+        mockGetBusEventsPage
+          .mockResolvedValueOnce({
+            events: [
+              { type: "message_delta", run_id: run.id, text: "first partial", _seq: 5 },
+              { type: "run_state", run_id: run.id, state: "idle", _seq: 6 },
+            ],
+            lastSeq: 6,
+            hasMore: false,
+            nextOffset: 180,
+          })
+          .mockResolvedValueOnce({
+            events: [
+              { type: "message_delta", run_id: run.id, text: "second partial", _seq: 7 },
+              { type: "run_state", run_id: run.id, state: "idle", _seq: 8 },
+            ],
+            lastSeq: 8,
+            hasMore: false,
+            nextOffset: 260,
+          })
+          .mockResolvedValueOnce({
+            events: [],
+            lastSeq: 8,
+            hasMore: false,
+            nextOffset: 260,
+          });
+
+        const testStore = new SessionStore();
+        await testStore.loadRun(run.id);
+
+        expect(mockGetHistorySummary).toHaveBeenNthCalledWith(2, run.id, true);
+        expect(mockGetHistorySummary).toHaveBeenNthCalledWith(3, run.id, true);
+        expect(mockGetBusEventsPage).toHaveBeenNthCalledWith(3, run.id, 8, 260);
+        expect(testStore.timeline.at(-1)).toMatchObject({
+          kind: "assistant",
+          id: "assistant-incomplete-7",
+        });
+        expect(testStore.phase).toBe("idle");
+        warnSpy.mockClear();
+      });
+
+      it("rebuilds instead of retaining interrupted subhistory streaming entries", async () => {
+        const run = makeRun("run-sub-interrupted-catchup", { status: "idle", agent: "claude" });
+        const initial = makeHistory(run.id);
+        const parent: HistoryEntry = {
+          kind: "tool",
+          id: "parent-tool",
+          anchorId: "parent-tool",
+          ts: "t",
+          toolUseId: "parent-tool",
+          toolName: "Agent",
+          status: "running",
+          input: {},
+          output: null,
+          subHistoryId: "parent-tool",
+          firstSeq: 2,
+          lastSeq: 2,
+        };
+        initial.page.entries = [initial.page.entries[0], parent];
+        initial.summary.lastSeq = 2;
+        initial.summary.sourceSize = 50;
+        const rebuilt = makeHistory(run.id);
+        rebuilt.summary.generationId = "gen-sub-rebuilt";
+        rebuilt.summary.lastSeq = 4;
+        rebuilt.summary.sourceSize = 140;
+        rebuilt.summary.latestCursor = "gen-sub-rebuilt:1";
+        rebuilt.page.generationId = "gen-sub-rebuilt";
+        rebuilt.page.pageCursor = "gen-sub-rebuilt:1";
+        rebuilt.page.lastSeq = 4;
+        rebuilt.page.entries = [
+          initial.page.entries[0],
+          {
+            ...parent,
+            status: "error",
+            output: { error: "Turn ended before tool result" },
+            lastSeq: 4,
+          },
+        ];
+        mockGetRun.mockResolvedValue(run);
+        mockGetHistorySummary
+          .mockResolvedValueOnce(initial.summary)
+          .mockResolvedValueOnce(rebuilt.summary);
+        mockGetHistoryPage.mockResolvedValueOnce(initial.page).mockResolvedValueOnce(rebuilt.page);
+        mockGetBusEventsPage
+          .mockResolvedValueOnce({
+            events: [
+              {
+                type: "message_delta",
+                run_id: run.id,
+                parent_tool_use_id: "parent-tool",
+                text: "child partial",
+                _seq: 3,
+              },
+              { type: "run_state", run_id: run.id, state: "idle", _seq: 4 },
+            ],
+            lastSeq: 4,
+            hasMore: false,
+            nextOffset: 140,
+          })
+          .mockResolvedValueOnce({
+            events: [],
+            lastSeq: 4,
+            hasMore: false,
+            nextOffset: 140,
+          });
+
+        const testStore = new SessionStore();
+        await testStore.loadRun(run.id);
+
+        const loadedParent = testStore.timeline.find(
+          (entry) => entry.kind === "tool" && entry.id === "parent-tool",
+        );
+        expect(loadedParent).toMatchObject({ kind: "tool", tool: { status: "error" } });
+        expect(
+          loadedParent?.kind === "tool"
+            ? loadedParent.subTimeline?.some((entry) => entry.id === "__sub_stream_parent-tool")
+            : false,
+        ).toBeFalsy();
+        warnSpy.mockClear();
+      });
+
+      it("replays an open semantic tail without incomplete entries or artificial errors", async () => {
+        const run = makeRun("run-open-tail", { status: "running", agent: "claude" });
+        const history = makeHistory(run.id);
+        history.page.entries = [
+          history.page.entries[0],
+          {
+            kind: "tool",
+            id: "parent-tool",
+            anchorId: "parent-tool",
+            ts: "t",
+            toolUseId: "parent-tool",
+            toolName: "Agent",
+            status: "running",
+            input: {},
+            output: null,
+            firstSeq: 2,
+            lastSeq: 2,
+          },
+        ];
+        history.summary.lastSeq = 2;
+        history.summary.sourceSize = 50;
+        mockGetRun.mockResolvedValue(run);
+        mockGetHistorySummary.mockResolvedValue(history.summary);
+        mockGetHistoryPage.mockResolvedValue(history.page);
+        mockGetBusEventsPage.mockResolvedValue({
+          events: [
+            { type: "message_delta", run_id: run.id, text: "partial", _seq: 3 },
+            {
+              type: "message_complete",
+              run_id: run.id,
+              message_id: "main-message",
+              text: "complete",
+              _seq: 4,
+            },
+            {
+              type: "tool_start",
+              run_id: run.id,
+              tool_use_id: "main-tool",
+              tool_name: "Bash",
+              input: {},
+              _seq: 5,
+            },
+            {
+              type: "tool_end",
+              run_id: run.id,
+              tool_use_id: "main-tool",
+              tool_name: "Bash",
+              output: { stdout: "done" },
+              status: "success",
+              _seq: 6,
+            },
+            {
+              type: "message_delta",
+              run_id: run.id,
+              parent_tool_use_id: "parent-tool",
+              text: "child partial",
+              _seq: 7,
+            },
+            {
+              type: "message_complete",
+              run_id: run.id,
+              parent_tool_use_id: "parent-tool",
+              message_id: "sub-message",
+              text: "child complete",
+              _seq: 8,
+            },
+            {
+              type: "tool_start",
+              run_id: run.id,
+              parent_tool_use_id: "parent-tool",
+              tool_use_id: "child-tool",
+              tool_name: "Bash",
+              input: {},
+              _seq: 9,
+            },
+            {
+              type: "tool_end",
+              run_id: run.id,
+              tool_use_id: "child-tool",
+              tool_name: "Bash",
+              output: { stdout: "child done" },
+              status: "success",
+              _seq: 10,
+            },
+          ],
+          lastSeq: 10,
+          hasMore: false,
+          nextOffset: 500,
+        });
+
+        const testStore = new SessionStore();
+        await testStore.loadRun(run.id);
+
+        expect(testStore.timeline.some((entry) => entry.id.includes("incomplete"))).toBe(false);
+        expect(
+          testStore.timeline.find(
+            (entry) => entry.kind === "assistant" && entry.id === "main-message",
+          ),
+        ).toMatchObject({ kind: "assistant", content: "complete" });
+        const mainTool = testStore.timeline.find(
+          (entry) => entry.kind === "tool" && entry.id === "main-tool",
+        ) as Extract<TimelineEntry, { kind: "tool" }>;
+        expect(mainTool.tool.status).toBe("success");
+        const parentTool = testStore.timeline.find(
+          (entry) => entry.kind === "tool" && entry.id === "parent-tool",
+        ) as Extract<TimelineEntry, { kind: "tool" }>;
+        expect(parentTool.subTimeline?.map((entry) => entry.id)).toEqual([
+          "sub-message",
+          "child-tool",
+        ]);
+        expect(
+          (parentTool.subTimeline?.[1] as Extract<TimelineEntry, { kind: "tool" }>).tool.status,
+        ).toBe("success");
+        warnSpy.mockClear();
+      });
+
+      it("bounds repeated semantic rebuilds even while checkpoints advance", async () => {
+        const run = makeRun("run-bounded-rebuild", { status: "idle", agent: "claude" });
+        const histories = Array.from({ length: 4 }, (_, index) => {
+          const history = makeHistory(run.id);
+          const suffix = index === 0 ? "initial" : String(index);
+          history.summary.generationId = `gen-bounded-${suffix}`;
+          history.summary.lastSeq = 4 + index * 2;
+          history.summary.sourceSize = 100 + index * 80;
+          history.page.generationId = history.summary.generationId;
+          history.page.lastSeq = history.summary.lastSeq;
+          return history;
+        });
+        mockGetRun.mockResolvedValue(run);
+        for (const history of histories) {
+          mockGetHistorySummary.mockResolvedValueOnce(history.summary);
+          mockGetHistoryPage.mockResolvedValueOnce(history.page);
+        }
+        for (let index = 0; index < 4; index++) {
+          const firstSeq = 5 + index * 2;
+          mockGetBusEventsPage.mockResolvedValueOnce({
+            events: [
+              { type: "message_delta", run_id: run.id, text: `partial-${index}`, _seq: firstSeq },
+              {
+                type: "run_state",
+                run_id: run.id,
+                state: "idle",
+                _seq: firstSeq + 1,
+              },
+            ],
+            lastSeq: firstSeq + 1,
+            hasMore: false,
+            nextOffset: 180 + index * 80,
+          });
+        }
+
+        const testStore = new SessionStore();
+        await testStore.loadRun(run.id);
+
+        expect(mockGetHistorySummary).toHaveBeenCalledTimes(4);
+        expect(mockGetBusEventsPage).toHaveBeenCalledTimes(4);
+        expect(testStore.phase).toBe("failed");
+        expect(testStore.error).toContain("bounded rebuilds");
+        warnSpy.mockClear();
+      });
+
+      it("restores pending permission and elicitation from history summary", async () => {
+        const run = makeRun("run-pending-history", { status: "running", agent: "claude" });
+        const history = makeHistory(run.id);
+        const stateEvents: BusEvent[] = [
+          {
+            type: "permission_prompt",
+            run_id: run.id,
+            request_id: "permission-1",
+            tool_use_id: "tool-pending",
+            tool_name: "Bash",
+            tool_input: { command: "pwd" },
+            decision_reason: "Needs approval",
+          },
+          {
+            type: "elicitation_prompt",
+            run_id: run.id,
+            request_id: "elicitation-1",
+            mcp_server_name: "server",
+            message: "Choose",
+            mode: "form",
+          },
+        ];
+        (history.summary as { stateEvents: BusEvent[] }).stateEvents = stateEvents;
+        mockGetRun.mockResolvedValue(run);
+        mockGetHistorySummary.mockResolvedValue(history.summary);
+        mockGetHistoryPage.mockResolvedValue(history.page);
+
+        const testStore = new SessionStore();
+        await testStore.loadRun(run.id);
+
+        expect(testStore.pendingToolPermissions).toHaveLength(1);
+        expect(testStore.pendingToolPermissions[0].requestId).toBe("permission-1");
+        expect(testStore.pendingElicitations.has("elicitation-1")).toBe(true);
+        warnSpy.mockClear();
+      });
+
+      it("force-rebuilds oversized catch-up and resumes from the rebuilt checkpoint", async () => {
+        const run = makeRun("run-catchup-rebuild", { status: "running", agent: "claude" });
+        const initial = makeHistory(run.id);
+        const rebuilt = makeHistory(run.id);
+        rebuilt.summary.generationId = "gen-oversized-rebuilt";
+        rebuilt.summary.lastSeq = 5;
+        rebuilt.summary.sourceSize = 250;
+        rebuilt.page.generationId = "gen-oversized-rebuilt";
+        rebuilt.page.lastSeq = 5;
+        rebuilt.page.entries.push({
+          kind: "assistant",
+          id: "oversized-message",
+          anchorId: "oversized-message",
+          ts: "t",
+          content: {
+            preview: "large answer",
+            byteLength: 100_000,
+            truncated: true,
+            contentId: "oversized-content",
+            encoding: "text",
+          },
+          firstSeq: 5,
+          lastSeq: 5,
+        });
+        mockGetRun.mockResolvedValue(run);
+        mockGetHistorySummary
+          .mockResolvedValueOnce(initial.summary)
+          .mockResolvedValueOnce(rebuilt.summary);
+        mockGetHistoryPage.mockResolvedValueOnce(initial.page).mockResolvedValueOnce(rebuilt.page);
+        mockGetBusEventsPage
+          .mockRejectedValueOnce(
+            new Error(
+              "HISTORY_PROJECTION_REQUIRED: bus event 5 exceeds catch-up page limit: 1500000 bytes",
+            ),
+          )
+          .mockResolvedValueOnce({
+            events: [],
+            lastSeq: 5,
+            hasMore: false,
+            nextOffset: 250,
+          });
+
+        const testStore = new SessionStore();
+        await testStore.loadRun(run.id);
+
+        expect(mockGetHistorySummary).toHaveBeenNthCalledWith(2, run.id, true);
+        expect(mockGetBusEventsPage).toHaveBeenNthCalledWith(2, run.id, 5, 250);
+        expect(mockGetHistorySummary).toHaveBeenCalledTimes(2);
+        expect(testStore.timeline.at(-1)).toMatchObject({
+          kind: "assistant",
+          id: "oversized-message",
+        });
+        expect(testStore.phase).toBe("running");
+        warnSpy.mockClear();
+      });
+
+      it("fails a forced rebuild whose checkpoint does not advance", async () => {
+        const run = makeRun("run-catchup-stalled-rebuild", {
+          status: "running",
+          agent: "claude",
+        });
+        mockGetRun.mockResolvedValue(run);
+        mockGetBusEventsPage.mockRejectedValueOnce(
+          new Error("HISTORY_PROJECTION_REQUIRED: bus event exceeds bounded catch-up line limit"),
+        );
+
+        const testStore = new SessionStore();
+        await testStore.loadRun(run.id);
+
+        expect(mockGetHistorySummary).toHaveBeenNthCalledWith(2, run.id, true);
+        expect(testStore.phase).toBe("failed");
+        expect(testStore.error).toContain("checkpoint did not advance");
+        warnSpy.mockClear();
+      });
+
+      it("rejects a catch-up page whose cursor does not advance", async () => {
+        const run = makeRun("run-stuck", { status: "running", agent: "claude" });
+        mockGetRun.mockResolvedValue(run);
+        (api.getBusEventsPage as ReturnType<typeof vi.fn>).mockResolvedValue({
+          events: [],
+          lastSeq: 4,
+          hasMore: true,
+          nextOffset: 100,
+        });
+
+        const testStore = new SessionStore();
+        await testStore.loadRun(run.id);
+
+        expect(testStore.phase).toBe("failed");
+        expect(testStore.error).toContain("did not advance");
+        warnSpy.mockClear();
+      });
+
+      it("ignores an older-page response after switching runs", async () => {
+        const firstRun = makeRun("run-stale-page", { status: "completed" });
+        const latest = makeHistory(firstRun.id, 2);
+        mockGetRun.mockResolvedValue(firstRun);
+        mockGetHistorySummary.mockResolvedValue(latest.summary);
+        mockGetHistoryPage.mockResolvedValueOnce(latest.page);
+        let resolveOlder!: (value: ReturnType<typeof makeHistory>["page"]) => void;
+        mockGetHistoryPage.mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              resolveOlder = resolve;
+            }),
+        );
+        const testStore = new SessionStore();
+        await testStore.loadRun(firstRun.id);
+        const olderRequest = testStore.loadOlderHistory();
+        testStore.reset();
+        resolveOlder(makeHistory(firstRun.id).page);
+
+        expect(await olderRequest).toBe(false);
+        expect(testStore.timeline).toHaveLength(0);
         warnSpy.mockClear();
       });
     });
 
-    describe("resumeSession snapshot", () => {
-      it("uses snapshot on hit and deletes after", async () => {
+    describe("resumeSession paged history", () => {
+      it("ignores legacy snapshots and restores the latest bounded page", async () => {
         const run = makeRun("run-res-1", {
           status: "stopped",
           agent: "claude",
@@ -4531,14 +6004,7 @@ describe("SessionStore reducer", () => {
         });
         mockGetRun.mockResolvedValue(run);
 
-        // Build snapshot from replay
-        const refStore = new SessionStore();
-        refStore.run = run;
-        refStore.phase = "stopped";
-        refStore.applyEventBatch(simpleChatEvents as BusEvent[], { replayOnly: true });
-        const snapBody = (refStore as unknown as { _buildSnapshot(): string })._buildSnapshot();
-
-        mockReadSnapshot.mockResolvedValue(snapBody);
+        mockReadSnapshot.mockResolvedValue("legacy full snapshot");
 
         const testStore = new SessionStore();
         testStore.agent = "claude";
@@ -4552,18 +6018,16 @@ describe("SessionStore reducer", () => {
 
         await testStore.resumeSession("run-res-1", "resume");
 
-        // Snapshot was read
-        expect(mockReadSnapshot).toHaveBeenCalledWith("run-res-1", "stopped");
-        // getBusEvents NOT called (snapshot hit)
+        expect(mockReadSnapshot).not.toHaveBeenCalled();
         expect(mockGetBusEvents).not.toHaveBeenCalled();
-        // Snapshot was deleted (session goes live)
+        expect(mockGetHistorySummary).toHaveBeenCalledWith("run-res-1");
+        expect(mockGetHistoryPage).toHaveBeenCalledWith("run-res-1", "gen-run-res-1");
         expect(mockDeleteSnapshot).toHaveBeenCalledWith("run-res-1");
-        // Timeline populated from snapshot
-        expect(testStore.timeline).toEqual(refStore.timeline);
+        expect(testStore.timeline).toHaveLength(2);
         warnSpy.mockClear();
       });
 
-      it("falls back to getBusEvents when snapshot corrupted and deletes", async () => {
+      it("does not fall back to a full event replay when a snapshot is corrupted", async () => {
         const run = makeRun("run-res-2", {
           status: "stopped",
           agent: "claude",
@@ -4571,7 +6035,6 @@ describe("SessionStore reducer", () => {
         });
         mockGetRun.mockResolvedValue(run);
         mockReadSnapshot.mockResolvedValue("bad json {{{"); // corrupted
-        mockGetBusEvents.mockResolvedValue(simpleChatEvents);
 
         const testStore = new SessionStore();
         testStore.agent = "claude";
@@ -4583,10 +6046,9 @@ describe("SessionStore reducer", () => {
 
         await testStore.resumeSession("run-res-2", "resume");
 
-        // Snapshot read attempted, then fell back to getBusEvents
-        expect(mockReadSnapshot).toHaveBeenCalled();
-        expect(mockGetBusEvents).toHaveBeenCalledWith("run-res-2");
-        // Still deleted (going live)
+        expect(mockReadSnapshot).not.toHaveBeenCalled();
+        expect(mockGetBusEvents).not.toHaveBeenCalled();
+        expect(mockGetHistorySummary).toHaveBeenCalledWith("run-res-2");
         expect(mockDeleteSnapshot).toHaveBeenCalledWith("run-res-2");
         expect(testStore.timeline.length).toBeGreaterThan(0);
         warnSpy.mockClear();
@@ -4615,81 +6077,123 @@ describe("SessionStore reducer", () => {
         expect(mockDeleteSnapshot).toHaveBeenCalledWith("run-res-3");
         warnSpy.mockClear();
       });
+
+      it("replays persisted events appended after the reusable generation before desktop resume", async () => {
+        const run = makeRun("run-res-catchup", {
+          status: "stopped",
+          agent: "claude",
+          session_id: "sess-catchup",
+        });
+        mockGetRun.mockResolvedValue(run);
+        mockGetBusEventsPage.mockResolvedValue({
+          events: [
+            {
+              type: "user_message",
+              run_id: run.id,
+              text: "appended question",
+              _seq: 5,
+            },
+            {
+              type: "message_complete",
+              run_id: run.id,
+              message_id: "appended-answer",
+              text: "appended answer",
+              _seq: 6,
+            },
+          ],
+          lastSeq: 6,
+          hasMore: false,
+          nextOffset: 180,
+        });
+        const mockStartSession = api.startSession as ReturnType<typeof vi.fn>;
+        mockStartSession.mockResolvedValue(undefined);
+        const testStore = new SessionStore();
+        testStore.run = run;
+        testStore.phase = "stopped";
+
+        await testStore.resumeSession(run.id, "resume");
+
+        expect(mockGetBusEventsPage).toHaveBeenCalledWith(run.id, 4, 100);
+        expect(testStore.timeline.slice(-2).map((entry) => entry.kind)).toEqual([
+          "user",
+          "assistant",
+        ]);
+        expect(testStore.timeline.at(-1)?.id).toBe("appended-answer");
+        expect(
+          testStore.timeline.filter(
+            (entry) => entry.kind === "assistant" && entry.id === "appended-answer",
+          ),
+        ).toHaveLength(1);
+        warnSpy.mockClear();
+      });
+
+      it("uses the same bounded catch-up for a newly copied fork without duplicating entries", async () => {
+        const source = makeRun("run-fork-source", {
+          status: "stopped",
+          agent: "claude",
+          session_id: "source-session",
+        });
+        const fork = makeRun("run-fork-target", {
+          status: "pending",
+          agent: "claude",
+          session_id: "fork-session",
+        });
+        mockGetRun.mockResolvedValueOnce(source).mockResolvedValueOnce(fork);
+        (api.forkSession as ReturnType<typeof vi.fn>).mockResolvedValue(fork.id);
+        mockGetHistorySummary.mockImplementation(
+          async (runId: string) => makeHistory(runId).summary,
+        );
+        mockGetHistoryPage.mockImplementation(async (runId: string) => makeHistory(runId).page);
+        mockGetBusEventsPage
+          .mockResolvedValueOnce({ events: [], lastSeq: 4, hasMore: false, nextOffset: 100 })
+          .mockResolvedValueOnce({
+            events: [
+              {
+                type: "message_complete",
+                run_id: fork.id,
+                message_id: "fork-tail",
+                text: "copied tail",
+                _seq: 5,
+              },
+            ],
+            lastSeq: 5,
+            hasMore: false,
+            nextOffset: 140,
+          });
+        const testStore = new SessionStore();
+        testStore.run = source;
+        testStore.phase = "stopped";
+
+        expect(await testStore.resumeSession(source.id, "fork")).toEqual({
+          status: "success",
+          runId: fork.id,
+        });
+
+        expect(mockGetBusEventsPage).toHaveBeenNthCalledWith(2, fork.id, 4, 100);
+        expect(
+          testStore.timeline.filter(
+            (entry) => entry.kind === "assistant" && entry.id === "fork-tail",
+          ),
+        ).toHaveLength(1);
+        warnSpy.mockClear();
+      });
     });
 
     // ── Idle snapshot paths ──
 
-    describe("idle session snapshot", () => {
-      it("snapshot hit (seq>0) → skip getBusEvents, phase = idle", async () => {
+    describe("idle paged history", () => {
+      it("loads derived history, invalidates snapshot, and keeps idle phase", async () => {
         const idleRun = makeRun("run-idle-1", { status: "idle", agent: "claude" });
         mockGetRun.mockResolvedValue(idleRun);
-
-        // Build a snapshot with seq > 0
-        const refStore = new SessionStore();
-        refStore.run = idleRun;
-        refStore.phase = "idle";
-        refStore.applyEventBatch(simpleChatEvents as BusEvent[]);
-        // Manually set _lastProcessedSeq > 0 to simulate a real snapshot
-        (refStore as any)._lastProcessedSeq = 42;
-        const snapshotBody = (refStore as any)._buildSnapshot();
-
-        mockReadSnapshot.mockResolvedValue(snapshotBody);
 
         const testStore = new SessionStore();
         await testStore.loadRun("run-idle-1");
 
-        expect(mockReadSnapshot).toHaveBeenCalledWith("run-idle-1", "idle");
+        expect(mockReadSnapshot).not.toHaveBeenCalled();
+        expect(mockDeleteSnapshot).toHaveBeenCalledWith("run-idle-1");
         expect(mockGetBusEvents).not.toHaveBeenCalled();
         expect(testStore.phase).toBe("idle");
         expect(testStore.timeline.length).toBeGreaterThan(0);
-        warnSpy.mockClear();
-      });
-
-      it("snapshot hit (seq=0) → deleteSnapshot + full replay", async () => {
-        vi.useFakeTimers();
-        const idleRun = makeRun("run-idle-2", { status: "idle", agent: "claude" });
-        mockGetRun.mockResolvedValue(idleRun);
-
-        // Build a snapshot with seq = 0 (no reliable seq)
-        const refStore = new SessionStore();
-        refStore.run = idleRun;
-        refStore.phase = "idle";
-        refStore.applyEventBatch(simpleChatEvents as BusEvent[]);
-        (refStore as any)._lastProcessedSeq = 0; // seq=0
-        const snapshotBody = (refStore as any)._buildSnapshot();
-
-        mockReadSnapshot.mockResolvedValue(snapshotBody);
-        mockGetBusEvents.mockResolvedValue(simpleChatEvents);
-
-        const testStore = new SessionStore();
-        await testStore.loadRun("run-idle-2");
-
-        // seq=0 → snapshot skipped, stale entry deleted
-        expect(mockDeleteSnapshot).toHaveBeenCalledWith("run-idle-2");
-        // Full replay via getBusEvents
-        expect(mockGetBusEvents).toHaveBeenCalledWith("run-idle-2");
-        expect(testStore.timeline.length).toBeGreaterThan(0);
-        // Flush deferred _saveSnapshotToIdb
-        vi.advanceTimersByTime(1);
-        vi.useRealTimers();
-        warnSpy.mockClear();
-      });
-
-      it("snapshot miss → write snapshot for idle session", async () => {
-        vi.useFakeTimers();
-        const idleRun = makeRun("run-idle-3", { status: "idle", agent: "claude" });
-        mockGetRun.mockResolvedValue(idleRun);
-        mockReadSnapshot.mockResolvedValue(null);
-        mockGetBusEvents.mockResolvedValue(simpleChatEvents);
-
-        const testStore = new SessionStore();
-        await testStore.loadRun("run-idle-3");
-
-        // Flush deferred _saveSnapshotToIdb
-        vi.advanceTimersByTime(1);
-        expect(mockWriteSnapshot).toHaveBeenCalled();
-        expect(testStore.timeline.length).toBeGreaterThan(0);
-        vi.useRealTimers();
         warnSpy.mockClear();
       });
 
@@ -4784,42 +6288,6 @@ describe("SessionStore reducer", () => {
         expect(tool).toBeDefined();
         expect(tool.tool.status).toBe("success");
         // dbgWarn should have been called for the index miss
-        warnSpy.mockClear();
-      });
-
-      it("seq=0 snapshot deleted, subsequent load does not re-hit stale entry", async () => {
-        vi.useFakeTimers();
-        const idleRun = makeRun("run-no-rehit", { status: "idle", agent: "claude" });
-        mockGetRun.mockResolvedValue(idleRun);
-
-        // First load: seq=0 snapshot
-        const refStore = new SessionStore();
-        refStore.run = idleRun;
-        refStore.phase = "idle";
-        refStore.applyEventBatch(simpleChatEvents as BusEvent[]);
-        (refStore as any)._lastProcessedSeq = 0;
-        const staleBody = (refStore as any)._buildSnapshot();
-
-        mockReadSnapshot.mockResolvedValueOnce(staleBody);
-        mockGetBusEvents.mockResolvedValue(simpleChatEvents);
-
-        const testStore = new SessionStore();
-        await testStore.loadRun("run-no-rehit");
-
-        // deleteSnapshot called for seq=0
-        expect(mockDeleteSnapshot).toHaveBeenCalledWith("run-no-rehit");
-
-        // Second load: snapshot gone (readSnapshot returns null)
-        mockReadSnapshot.mockResolvedValueOnce(null);
-        mockGetBusEvents.mockResolvedValue(simpleChatEvents);
-
-        const testStore2 = new SessionStore();
-        await testStore2.loadRun("run-no-rehit");
-
-        // Normal full replay — no snapshot hit
-        expect(testStore2.timeline.length).toBeGreaterThan(0);
-        vi.advanceTimersByTime(1);
-        vi.useRealTimers();
         warnSpy.mockClear();
       });
     });
@@ -6647,5 +8115,137 @@ describe("SessionStart sessionTitle auto-naming", () => {
     } as BusEvent);
     expect(store.run?.name).toBeUndefined();
     expect(api.renameRun).not.toHaveBeenCalled();
+  });
+});
+
+// ── user_rejected_tool_use → ToolEnd(status "rejected") ──
+
+describe("rejected tool status (user_rejected_tool_use)", () => {
+  it("marks a running tool as rejected on tool_end with status rejected", () => {
+    const store = new SessionStore();
+    store.run = makeRun("run-rej-1");
+    store.phase = "running";
+    store.applyEvent({
+      type: "tool_start",
+      run_id: "run-rej-1",
+      tool_use_id: "tu-1",
+      tool_name: "Bash",
+      input: { command: "sleep 3600" },
+    } as BusEvent);
+    expect(store.timeline.find((e) => e.kind === "tool" && e.id === "tu-1")).toBeDefined();
+
+    store.applyEvent({
+      type: "tool_end",
+      run_id: "run-rej-1",
+      tool_use_id: "tu-1",
+      tool_name: "Bash",
+      // Rust side emits JSON null (BusEvent::ToolEnd output: Value::Null) —
+      // keep the true shape so null-safety regressions surface in tests.
+      output: null as unknown as Record<string, unknown>,
+      status: "rejected",
+    } as BusEvent);
+    const entry = store.timeline.find((e) => e.kind === "tool" && e.id === "tu-1") as Extract<
+      TimelineEntry,
+      { kind: "tool" }
+    >;
+    expect(entry.tool.status).toBe("rejected");
+    // Terminal state — the interrupted tool must NOT stay "running"
+    expect(entry.tool.status).not.toBe("running");
+  });
+
+  it("routes rejected tool_end into the subagent subTimeline", () => {
+    const store = new SessionStore();
+    store.run = makeRun("run-rej-2");
+    store.phase = "running";
+    store.applyEventBatch([
+      {
+        type: "tool_start",
+        run_id: "run-rej-2",
+        tool_use_id: "task-1",
+        tool_name: "Task",
+        input: {},
+      },
+      {
+        type: "tool_start",
+        run_id: "run-rej-2",
+        tool_use_id: "bash-1",
+        tool_name: "Bash",
+        input: { command: "ls" },
+        parent_tool_use_id: "task-1",
+      },
+    ] as BusEvent[]);
+    store.applyEvent({
+      type: "tool_end",
+      run_id: "run-rej-2",
+      tool_use_id: "bash-1",
+      tool_name: "Bash",
+      // Rust side emits JSON null (BusEvent::ToolEnd output: Value::Null) —
+      // keep the true shape so null-safety regressions surface in tests.
+      output: null as unknown as Record<string, unknown>,
+      status: "rejected",
+      parent_tool_use_id: "task-1",
+    } as BusEvent);
+    const taskEntry = store.timeline.find((e) => e.kind === "tool" && e.id === "task-1") as Extract<
+      TimelineEntry,
+      { kind: "tool" }
+    >;
+    expect(taskEntry.subTimeline).toBeDefined();
+    const child = taskEntry.subTimeline!.find((e) => e.kind === "tool" && e.id === "bash-1");
+    expect(child && child.kind === "tool" ? child.tool.status : undefined).toBe("rejected");
+  });
+
+  it("keeps an interrupted AskUserQuestion rejected (not ask_pending)", () => {
+    const store = new SessionStore();
+    store.run = makeRun("run-rej-3");
+    store.phase = "running";
+    store.applyEvent({
+      type: "tool_start",
+      run_id: "run-rej-3",
+      tool_use_id: "ask-1",
+      tool_name: "AskUserQuestion",
+      input: {},
+    } as BusEvent);
+    store.applyEvent({
+      type: "tool_end",
+      run_id: "run-rej-3",
+      tool_use_id: "ask-1",
+      tool_name: "AskUserQuestion",
+      // Rust side emits JSON null (BusEvent::ToolEnd output: Value::Null) —
+      // keep the true shape so null-safety regressions surface in tests.
+      output: null as unknown as Record<string, unknown>,
+      status: "rejected",
+    } as BusEvent);
+    const entry = store.timeline.find((e) => e.kind === "tool" && e.id === "ask-1") as Extract<
+      TimelineEntry,
+      { kind: "tool" }
+    >;
+    // Interrupted ≠ answerable again — must stay rejected, not flip to ask_pending
+    expect(entry.tool.status).toBe("rejected");
+  });
+
+  it("does NOT switch permissionMode to plan when EnterPlanMode is rejected", () => {
+    const store = new SessionStore();
+    store.run = makeRun("run-rej-4");
+    store.phase = "running";
+    store.permissionMode = "default";
+    store.applyEvent({
+      type: "tool_start",
+      run_id: "run-rej-4",
+      tool_use_id: "plan-1",
+      tool_name: "EnterPlanMode",
+      input: {},
+    } as BusEvent);
+    store.applyEvent({
+      type: "tool_end",
+      run_id: "run-rej-4",
+      tool_use_id: "plan-1",
+      tool_name: "EnterPlanMode",
+      // Rust side emits JSON null (BusEvent::ToolEnd output: Value::Null) —
+      // keep the true shape so null-safety regressions surface in tests.
+      output: null as unknown as Record<string, unknown>,
+      status: "rejected",
+    } as BusEvent);
+    // Whitelist "success" only — a rejected plan-mode entry must not flip the mode
+    expect(store.permissionMode).toBe("default");
   });
 });

@@ -20,6 +20,10 @@ import type {
   SessionMode,
   TodoItem,
   PanelTask,
+  CodexAgentIdentity,
+  HistoryEntry,
+  HistoryPage,
+  HistorySummary,
 } from "$lib/types";
 import { dbg, dbgWarn } from "$lib/utils/debug";
 import { yieldToMain } from "$lib/utils/yield";
@@ -55,6 +59,11 @@ import {
 const CLI_PERM_MODE_ALIASES: Record<string, string> = {
   delegate: "acceptEdits", // CLI v2.1.81+ renamed acceptEdits → delegate
 };
+
+const MAX_HISTORY_PROJECTION_REBUILDS = 3;
+const HISTORY_PROJECTION_REQUIRED = "HISTORY_PROJECTION_REQUIRED";
+const HISTORY_PREPEND_PAGE_LIMIT = 12;
+const HISTORY_PREPEND_ENTRY_TARGET = 50;
 
 function normalizePermissionMode(mode: string): string {
   return CLI_PERM_MODE_ALIASES[mode] ?? mode;
@@ -103,6 +112,15 @@ class OpGuard {
   }
 }
 
+export type ResumeSessionResult =
+  | { status: "success"; runId: string }
+  | { status: "failed" }
+  | { status: "cancelled" };
+
+export type StartSessionResult = { status: "success"; runId: string } | { status: "cancelled" };
+
+export type SendMessageResult = { status: "success" } | { status: "cancelled" };
+
 // ── Helpers ──
 
 function eventTs(ev: BusEvent): string {
@@ -128,6 +146,115 @@ function eventTsMs(ev: BusEvent): number {
   const iso = eventTs(ev);
   const ms = new Date(iso).getTime();
   return Number.isFinite(ms) ? ms : Date.now();
+}
+
+function historyEntryToTimeline(entry: HistoryEntry): TimelineEntry {
+  switch (entry.kind) {
+    case "user":
+      return {
+        kind: "user",
+        id: entry.id,
+        anchorId: entry.anchorId,
+        content: entry.content.preview,
+        ts: entry.ts,
+        attachments: entry.attachments,
+        cliUuid: entry.cliUuid,
+        historyContent: entry.content.truncated ? entry.content : undefined,
+      };
+    case "assistant":
+      return {
+        kind: "assistant",
+        id: entry.id,
+        anchorId: entry.anchorId,
+        content: entry.content.preview,
+        ts: entry.ts,
+        thinkingText: entry.thinking?.preview,
+        model: entry.model,
+        historyContent: entry.content.truncated ? entry.content : undefined,
+        thinkingHistoryContent: entry.thinking?.truncated ? entry.thinking : undefined,
+      };
+    case "tool":
+      return {
+        kind: "tool",
+        id: entry.id,
+        anchorId: entry.anchorId,
+        ts: entry.ts,
+        tool: {
+          tool_use_id: entry.toolUseId,
+          tool_name: entry.toolName,
+          status: entry.status,
+          input: entry.input,
+          output: entry.output ?? undefined,
+          tool_use_result: entry.toolUseResult,
+          duration_ms: entry.durationMs,
+          _historyContent: {
+            input: entry.inputContent,
+            output: entry.outputContent,
+            result: entry.resultContent,
+          },
+          _subHistoryId: entry.subHistoryId,
+        },
+      };
+    case "command_output":
+    case "placeholder":
+      return {
+        kind: "command_output",
+        id: entry.id,
+        anchorId: entry.anchorId,
+        content: entry.content.preview,
+        ts: entry.ts,
+        historyContent: entry.content.truncated ? entry.content : undefined,
+      };
+  }
+}
+
+class CatchupSemanticTracker {
+  private streamingScopes = new Set<string>();
+  private openTools = new Set<string>();
+
+  observe(event: BusEvent): boolean {
+    const raw = event as BusEvent & {
+      parent_tool_use_id?: string;
+      tool_use_id?: string;
+      state?: string;
+    };
+    const scope = raw.parent_tool_use_id || "__main";
+    const isTurnBoundary =
+      (event.type === "user_message" && scope === "__main") ||
+      (event.type === "run_state" &&
+        ["spawning", "running", "idle", "completed", "failed", "stopped"].includes(
+          raw.state ?? "",
+        ));
+    if (isTurnBoundary) {
+      const interrupted = this.streamingScopes.size > 0 || this.openTools.size > 0;
+      this.streamingScopes.clear();
+      this.openTools.clear();
+      return interrupted;
+    }
+    switch (event.type) {
+      case "message_delta":
+      case "thinking_delta":
+        this.streamingScopes.add(scope);
+        break;
+      case "message_complete":
+        this.streamingScopes.delete(scope);
+        break;
+      case "tool_start":
+        if (raw.tool_use_id) this.openTools.add(`${scope}\0${raw.tool_use_id}`);
+        break;
+      case "tool_end":
+        if (raw.tool_use_id) {
+          const exact = `${scope}\0${raw.tool_use_id}`;
+          if (!this.openTools.delete(exact)) {
+            for (const key of this.openTools) {
+              if (key.endsWith(`\0${raw.tool_use_id}`)) this.openTools.delete(key);
+            }
+          }
+        }
+        break;
+    }
+    return false;
+  }
 }
 
 // ── Internal batch state (plain objects, no reactivity) ──
@@ -164,6 +291,10 @@ interface ReduceCtx {
    *  creation; only committed in _commitReduceCtx. Keeps async replay
    *  stale-safe (mid-batch abort doesn't pollute live store). */
   scheduledTasks: ScheduledTask[];
+  /** Spawned Codex identities resolved during replay; committed atomically with the timeline. */
+  codexAgentInfo: Record<string, CodexAgentIdentity>;
+  codexAgentInfoVersion: number;
+  codexAgentInfoDirty: boolean;
 }
 
 // ── Helpers ──
@@ -175,49 +306,6 @@ function timelineAttachments(atts: Attachment[]): Attachment[] | undefined {
   return atts.map((a) =>
     (IMAGE_TYPES as readonly string[]).includes(a.type) ? a : { ...a, contentBase64: "" },
   );
-}
-
-/** Replay RunEvent[] into an xterm terminal.
- *  Handles: user (prompt), system (status), stdout (agent output),
- *  stderr (error stream), assistant (final reply). */
-function replayTerminalEvents(
-  events: import("$lib/types").RunEvent[],
-  xtermRef: { writeText(s: string): void },
-  isRunning: boolean,
-): void {
-  let hasHistory = false;
-  for (const event of events) {
-    const text = String(
-      (event.payload as Record<string, unknown>).text ??
-        (event.payload as Record<string, unknown>).message ??
-        "",
-    );
-    if (!text) continue;
-    switch (event.type) {
-      case "user":
-        xtermRef.writeText(`\x1b[1;36m> ${text}\x1b[0m\r\n`);
-        hasHistory = true;
-        break;
-      case "system":
-        xtermRef.writeText(`\x1b[90m${text}\x1b[0m\r\n`);
-        break;
-      case "stdout":
-        xtermRef.writeText(text);
-        hasHistory = true;
-        break;
-      case "stderr":
-        xtermRef.writeText(`\x1b[31m${text}\x1b[0m\r\n`);
-        hasHistory = true;
-        break;
-      case "assistant":
-        xtermRef.writeText(`${text}\r\n`);
-        hasHistory = true;
-        break;
-    }
-  }
-  if (hasHistory && !isRunning) {
-    xtermRef.writeText(`\r\n\x1b[90m--- Session ended ---\x1b[0m\r\n`);
-  }
 }
 
 /** Map frontend Attachment[] to backend AttachmentData format for IPC. */
@@ -242,6 +330,8 @@ export interface ElicitationState {
   mode?: string;
   url?: string;
   requestedSchema?: ElicitationSchema;
+  responseStatus?: "pending" | "responding" | "error";
+  responseError?: string;
 }
 
 export interface TaskNotificationItem {
@@ -305,7 +395,14 @@ export class SessionStore {
       hook_id: string;
       data: unknown;
       request_id?: string;
-      status?: "hook_pending" | "allowed" | "denied" | "cancelled";
+      status?:
+        | "hook_pending"
+        | "responding"
+        | "allowed"
+        | "denied"
+        | "cancelled"
+        | "resolved"
+        | "error";
       hook_name?: string;
       stdout?: string;
       stderr?: string;
@@ -344,6 +441,9 @@ export class SessionStore {
   /** Codex Wave-4: latest cumulative turn diff (`turn/diff/updated`). Live-only,
    *  not replayed — cleared at the start of each turn (run_state→running) and on reset. */
   turnDiff = $state<string>("");
+  /** Spawned Codex thread identities resolved by the backend via `thread/read`. */
+  codexAgentInfo = $state<Record<string, CodexAgentIdentity>>({});
+  private _codexAgentInfoVersion = 0;
 
   // ── CLI verbose fields (from session_init / usage_update) ──
   cliVersion = $state<string>("");
@@ -440,6 +540,11 @@ export class SessionStore {
   private _toolHeIndex = new Map<string, number>();
   /** _lastProcessedSeq at last snapshot write — throttles idle snapshot rewrites. */
   private _lastSnapshotSeq = 0;
+
+  historySummary: HistorySummary | null = $state(null);
+  historyPageCursor: string | null = $state(null);
+  historyHasMore = $state(false);
+  historyLoadingOlder = $state(false);
 
   /** Runtime state: whether the current run uses chat timeline (bus-events) rendering.
    *  Only meaningful when `this.run` is set. Set by loadRun/startSession/resumeSession. */
@@ -705,7 +810,9 @@ export class SessionStore {
 
   /** Whether any MCP elicitation prompt is pending user response. */
   get hasElicitation(): boolean {
-    return this.pendingElicitations.size > 0;
+    return [...this.pendingElicitations.values()].some(
+      (elicitation) => (elicitation.responseStatus ?? "pending") === "pending",
+    );
   }
 
   /** True when the turn is legitimately paused waiting on the user (permission approval,
@@ -1040,7 +1147,7 @@ export class SessionStore {
     return undefined;
   }
 
-  /** Search ALL subTimelines (one level deep) for a tool with the given id.
+  /** Search all nested subTimelines for a tool with the given id.
    *  Used when parent_tool_use_id is missing but the tool exists in a subTimeline.
    *  Returns true if found and updated; false if not found. */
   private _updateToolInAnySubTimeline(
@@ -1049,27 +1156,40 @@ export class SessionStore {
     ctx: ReduceCtx | null,
   ): boolean {
     const tl = ctx ? ctx.tl : this.timeline;
-    for (let pIdx = 0; pIdx < tl.length; pIdx++) {
-      const entry = tl[pIdx];
-      if (entry.kind !== "tool" || !entry.subTimeline) continue;
-      const sub = entry.subTimeline;
-      const cIdx = sub.findIndex((e) => e.kind === "tool" && e.id === toolUseId);
-      if (cIdx < 0) continue;
-      // Found in this parent's subTimeline — update it
-      const oldChild = sub[cIdx] as Extract<TimelineEntry, { kind: "tool" }>;
-      const newSub = [...sub];
-      newSub[cIdx] = { ...oldChild, tool: updater(oldChild.tool) };
-      const updatedParent: TimelineEntry = { ...entry, subTimeline: newSub };
-      if (ctx) {
-        ctx.tl[pIdx] = updatedParent;
-      } else {
-        const u = [...this.timeline];
-        u[pIdx] = updatedParent;
-        this.timeline = u;
+    const updateNested = (
+      entries: TimelineEntry[],
+    ): { entries: TimelineEntry[]; found: boolean; parentId?: string } => {
+      for (let idx = 0; idx < entries.length; idx++) {
+        const entry = entries[idx];
+        if (entry.kind !== "tool") continue;
+        if (entry.id === toolUseId) {
+          const next = [...entries];
+          next[idx] = { ...entry, tool: updater(entry.tool) };
+          return { entries: next, found: true };
+        }
+        if (!entry.subTimeline) continue;
+        const nested = updateNested(entry.subTimeline);
+        if (nested.found) {
+          const next = [...entries];
+          next[idx] = { ...entry, subTimeline: nested.entries };
+          return { entries: next, found: true, parentId: nested.parentId ?? entry.id };
+        }
       }
+      return { entries, found: false };
+    };
+
+    for (let parentIdx = 0; parentIdx < tl.length; parentIdx++) {
+      const parent = tl[parentIdx];
+      if (parent.kind !== "tool" || !parent.subTimeline) continue;
+      const nested = updateNested(parent.subTimeline);
+      if (!nested.found) continue;
+      const updated = [...tl];
+      updated[parentIdx] = { ...parent, subTimeline: nested.entries };
+      if (ctx) ctx.tl = updated;
+      else this.timeline = updated;
       dbg("store", "found tool in subTimeline (missing parent_tool_use_id)", {
         tool: toolUseId,
-        parent: entry.id,
+        parent: nested.parentId ?? parent.id,
       });
       return true;
     }
@@ -1314,6 +1434,9 @@ export class SessionStore {
       toolTlIndex: batchTlIndex,
       toolHeIndex: batchHeIndex,
       scheduledTasks: [...this.scheduledTasks],
+      codexAgentInfo: { ...this.codexAgentInfo },
+      codexAgentInfoVersion: this._codexAgentInfoVersion,
+      codexAgentInfoDirty: false,
     };
   }
 
@@ -1363,6 +1486,15 @@ export class SessionStore {
     this._toolTlIndex = ctx.toolTlIndex;
     this._toolHeIndex = ctx.toolHeIndex;
     this.scheduledTasks = ctx.scheduledTasks;
+    if (ctx.codexAgentInfoDirty) {
+      // A live identity may arrive while async replay yields. Preserve that newer value while
+      // still publishing identities that exist only in the replay batch.
+      this.codexAgentInfo =
+        this._codexAgentInfoVersion === ctx.codexAgentInfoVersion
+          ? ctx.codexAgentInfo
+          : { ...ctx.codexAgentInfo, ...this.codexAgentInfo };
+      this._codexAgentInfoVersion++;
+    }
     if (!replayOnly) {
       this._setPhase(ctx.phase);
       this.error = ctx.error;
@@ -1546,6 +1678,8 @@ export class SessionStore {
     this.sessionCommands = [];
     this.mcpServers = [];
     this.turnDiff = "";
+    this.codexAgentInfo = {};
+    this._codexAgentInfoVersion++;
     this.cliVersion = "";
     // NOTE: permissionMode intentionally NOT cleared — user-level preference, same as platformId.
     // However, if persist had failed, reset the flag so next session_init can re-sync.
@@ -1597,6 +1731,215 @@ export class SessionStore {
     this._toolTlIndex.clear();
     this._toolHeIndex.clear();
     this._lastSnapshotSeq = 0;
+    this.historySummary = null;
+    this.historyPageCursor = null;
+    this.historyHasMore = false;
+    this.historyLoadingOlder = false;
+  }
+
+  private _applyHistoryPage(summary: HistorySummary, page: HistoryPage): void {
+    if (page.generationId !== summary.generationId) {
+      throw new Error("History generation changed while loading");
+    }
+    this.timeline = page.entries.map(historyEntryToTimeline);
+    this.historySummary = summary;
+    this.historyPageCursor = page.pageCursor;
+    this.historyHasMore = page.hasMore;
+    this.numTurns = summary.totalTurns;
+    this._lastProcessedSeq = summary.lastSeq;
+    this._toolTlIndex.clear();
+    for (let i = 0; i < this.timeline.length; i++) {
+      const entry = this.timeline[i];
+      if (entry.kind === "tool" && !this._toolTlIndex.has(entry.id)) {
+        this._toolTlIndex.set(entry.id, i);
+      }
+    }
+    dbg("history", "latest page applied", {
+      generation: summary.generationId,
+      entries: page.entries.length,
+      totalEntries: summary.totalEntries,
+      hasMore: page.hasMore,
+    });
+  }
+
+  private async _loadLatestHistory(
+    runId: string,
+    isStale: () => boolean,
+    refresh = false,
+  ): Promise<HistorySummary | null> {
+    const summary = refresh
+      ? await api.getHistorySummary(runId, true)
+      : await api.getHistorySummary(runId);
+    if (isStale()) return null;
+    const page =
+      summary.pageCount > 0 ? await api.getHistoryPage(runId, summary.generationId) : null;
+    if (isStale()) return null;
+    if (page) {
+      this._applyHistoryPage(summary, page);
+    } else {
+      this.historySummary = summary;
+      this._lastProcessedSeq = summary.lastSeq;
+    }
+    // Interaction events mutate entries from the projected page, so restore them only after the
+    // page is installed; applying them first would discard synthetic pending permission cards.
+    if (summary.stateEvents.length > 0) {
+      this.applyEventBatch(summary.stateEvents, { replayOnly: true });
+    }
+    return summary;
+  }
+
+  private async _loadHistoryWithCatchup(
+    runId: string,
+    isStale: () => boolean,
+    replayOnly: boolean,
+  ): Promise<{ summary: HistorySummary; catchupCount: number } | null> {
+    let summary = await this._loadLatestHistory(runId, isStale);
+    if (!summary) return null;
+    let catchupSeq = summary.lastSeq;
+    let catchupOffset = summary.sourceSize;
+    let projectionRebuilds = 0;
+    let catchupCount = 0;
+    let semanticTracker = new CatchupSemanticTracker();
+    const rebuildProjection = async (reason: "oversized" | "semantic"): Promise<boolean> => {
+      if (projectionRebuilds >= MAX_HISTORY_PROJECTION_REBUILDS) {
+        throw new Error(`History catch-up remained ${reason} after bounded rebuilds`);
+      }
+      const previousSeq = catchupSeq;
+      const previousOffset = catchupOffset;
+      projectionRebuilds += 1;
+      this._clearContentState();
+      const rebuilt = await this._loadLatestHistory(runId, isStale, true);
+      if (!rebuilt) return false;
+      const regressed = rebuilt.lastSeq < previousSeq || rebuilt.sourceSize < previousOffset;
+      const advanced = rebuilt.lastSeq > previousSeq || rebuilt.sourceSize > previousOffset;
+      if (regressed || !advanced) {
+        throw new Error("History projection checkpoint did not advance during rebuild");
+      }
+      summary = rebuilt;
+      catchupSeq = rebuilt.lastSeq;
+      catchupOffset = rebuilt.sourceSize;
+      catchupCount = 0;
+      semanticTracker = new CatchupSemanticTracker();
+      dbg("history", "projection rebuilt", {
+        runId,
+        reason,
+        attempt: projectionRebuilds,
+        lastSeq: catchupSeq,
+        sourceSize: catchupOffset,
+      });
+      return true;
+    };
+    while (true) {
+      let catchupPage;
+      try {
+        catchupPage = await api.getBusEventsPage(runId, catchupSeq, catchupOffset);
+      } catch (e) {
+        if (!String(e).includes(HISTORY_PROJECTION_REQUIRED)) throw e;
+        dbgWarn("history", "catch-up contains oversized event; rebuilding pages", e);
+        if (!(await rebuildProjection("oversized"))) return null;
+        continue;
+      }
+      if (isStale()) return null;
+      const crossedInterruptedBoundary = catchupPage.events.some((event) =>
+        semanticTracker.observe(event),
+      );
+      if (crossedInterruptedBoundary) {
+        dbg("history", "catch-up crossed interrupted turn; rebuilding projection", {
+          runId,
+          events: catchupPage.events.length,
+        });
+        if (!(await rebuildProjection("semantic"))) return null;
+        continue;
+      }
+      if (catchupPage.events.length > 0) {
+        const ms = await this.applyEventBatchAsync(catchupPage.events, {
+          replayOnly,
+          isStale,
+        });
+        if (ms === null) return null;
+        catchupCount += catchupPage.events.length;
+      }
+      if (!catchupPage.hasMore) break;
+      if (catchupPage.lastSeq <= catchupSeq) {
+        throw new Error("History catch-up cursor did not advance");
+      }
+      catchupSeq = catchupPage.lastSeq;
+      catchupOffset = catchupPage.nextOffset;
+      dbg("history", "catch-up page applied", {
+        runId,
+        events: catchupPage.events.length,
+        lastSeq: catchupSeq,
+      });
+    }
+    return { summary, catchupCount };
+  }
+
+  async loadOlderHistory(): Promise<boolean> {
+    const runId = this.run?.id;
+    const summary = this.historySummary;
+    const cursor = this.historyPageCursor;
+    if (!runId || !summary || !cursor || !this.historyHasMore || this.historyLoadingOlder) {
+      return false;
+    }
+    const loadGen = this._loadGen;
+    this.historyLoadingOlder = true;
+    try {
+      const existing = new Set(this.timeline.map((entry) => `${entry.kind}:${entry.id}`));
+      const pages: TimelineEntry[][] = [];
+      let nextCursor = cursor;
+      let hasMore: boolean = this.historyHasMore;
+      let pageCount = 0;
+      let entryCount = 0;
+      while (
+        hasMore &&
+        pageCount < HISTORY_PREPEND_PAGE_LIMIT &&
+        entryCount < HISTORY_PREPEND_ENTRY_TARGET
+      ) {
+        const page = await api.getHistoryPage(runId, summary.generationId, nextCursor);
+        if (loadGen !== this._loadGen || this.run?.id !== runId) return false;
+        if (page.generationId !== summary.generationId) {
+          throw new Error("History generation changed while loading older messages");
+        }
+        if (page.pageCursor === nextCursor && page.hasMore) {
+          throw new Error("History page cursor did not advance while loading older messages");
+        }
+        const older = page.entries.map(historyEntryToTimeline).filter((entry) => {
+          const key = `${entry.kind}:${entry.id}`;
+          if (existing.has(key)) return false;
+          existing.add(key);
+          return true;
+        });
+        // Pages arrive newest-to-oldest; prepend each page to retain chronological order when
+        // the batch is committed to the timeline once after all bounded reads complete.
+        pages.unshift(older);
+        entryCount += older.length;
+        pageCount += 1;
+        nextCursor = page.pageCursor;
+        hasMore = page.hasMore;
+      }
+      const older = pages.flat();
+      this.timeline = [...older, ...this.timeline];
+      this.historyPageCursor = nextCursor;
+      this.historyHasMore = hasMore;
+      this._toolTlIndex.clear();
+      for (let i = 0; i < this.timeline.length; i++) {
+        const entry = this.timeline[i];
+        if (entry.kind === "tool" && !this._toolTlIndex.has(entry.id)) {
+          this._toolTlIndex.set(entry.id, i);
+        }
+      }
+      dbg("history", "older page prepended", {
+        entries: older.length,
+        pages: pageCount,
+        hasMore,
+      });
+      return older.length > 0;
+    } catch (e) {
+      dbgWarn("history", "older page failed", e);
+      throw e;
+    } finally {
+      if (loadGen === this._loadGen) this.historyLoadingOlder = false;
+    }
   }
 
   /** Optimistically remove an elicitation after responding.
@@ -1679,6 +2022,7 @@ export class SessionStore {
       apiKeySource: this.apiKeySource,
       sessionCommands: this.sessionCommands,
       mcpServers: this.mcpServers,
+      codexAgentInfo: this.codexAgentInfo,
       sessionTools: this.sessionTools,
       availableAgents: this.availableAgents,
       availableSkills: this.availableSkills,
@@ -1797,6 +2141,8 @@ export class SessionStore {
       this.apiKeySource = (obj.apiKeySource as string) ?? "";
       this.sessionCommands = (obj.sessionCommands ?? []) as CliCommand[];
       this.mcpServers = dedupeMcpServersByName((obj.mcpServers ?? []) as McpServerInfo[]);
+      this.codexAgentInfo = (obj.codexAgentInfo as typeof this.codexAgentInfo | undefined) ?? {};
+      this._codexAgentInfoVersion++;
       this.sessionTools = (obj.sessionTools ?? []) as string[];
       this.availableAgents = (obj.availableAgents ?? []) as string[];
       this.availableSkills = (obj.availableSkills ?? []) as string[];
@@ -1887,16 +2233,20 @@ export class SessionStore {
   async loadRun(
     id: string,
     xtermRef?: { clear(): void; writeText(s: string): void },
-  ): Promise<void> {
+  ): Promise<boolean> {
     const gen = ++this._loadGen;
     const loadStart = performance.now();
+    const middleware = getEventMiddleware();
     dbg("store", "loadRun id=", id, "gen=", gen);
     void loadCompletionSoundPref(); // cached; ensures the sound pref is ready before any turn completes (#123)
 
     if (!id) {
       this.reset();
-      return;
+      return true;
     }
+
+    const historyLoadToken = middleware.beginHistoryLoad(id, this);
+    let historyLoadReleased = false;
 
     // Reset state for new load
     this._setPhase("loading");
@@ -1911,7 +2261,7 @@ export class SessionStore {
       this.run = await api.getRun(id);
       if (gen !== this._loadGen) {
         dbg("store", "stale after getRun, gen=", gen);
-        return;
+        return false;
       }
 
       // Auto-sync CLI imports to pick up events written after the initial import
@@ -1932,7 +2282,7 @@ export class SessionStore {
         }
         if (gen !== this._loadGen) {
           dbg("store", "stale after auto-sync, gen=", gen);
-          return;
+          return false;
         }
       }
 
@@ -1946,6 +2296,8 @@ export class SessionStore {
       const st = this.run.status;
       if (st === "running") {
         this._setPhase("running");
+      } else if (st === "idle") {
+        this._setPhase("idle");
       } else if (st === "completed" || st === "failed" || st === "stopped") {
         this._setPhase(st as SessionPhase);
       } else {
@@ -1962,176 +2314,34 @@ export class SessionStore {
         this.run!.execution_path === "session_actor" ||
         (this.run!.execution_path === "pipe_exec" && !isTerminal && !!this.run!.conversation_ref);
 
-      if (this.useStreamSession) {
-        let reducerMs = 0;
-        let snapshotHit = false;
-
-        // Try IDB snapshot (terminal + idle sessions)
-        const snapshotEligible = isTerminal || this.run!.status === "idle";
-        let snapshotBody: string | null = null;
-        if (snapshotEligible) {
-          try {
-            snapshotBody = await snapshotCache.readSnapshot(id, this.run!.status);
-          } catch {
-            /* IDB unavailable → miss */
-          }
-          if (gen !== this._loadGen) return;
-        }
-
-        if (snapshotBody) {
-          const isIdleSnap = !isTerminal;
-          // Parse once, used for both seq check and apply
-          const parsed = this._parseSnapshotBody(snapshotBody);
-          if (!parsed) {
-            snapshotBody = null; // corrupted JSON
-          } else {
-            const snapSeq = isIdleSnap ? ((parsed._lastProcessedSeq as number) ?? 0) : 1;
-
-            if (snapSeq === 0 && isIdleSnap) {
-              // seq=0: skip snapshot, delete stale entry to prevent repeated hit-then-skip
-              dbg("store", "idle snapshot seq=0, skipping for full replay");
-              snapshotCache.deleteSnapshot(id).catch(() => {});
-              snapshotBody = null; // fall through to miss path
-            } else if (this._tryApplySnapshot(parsed) && this._restoredSnapshotIsUsable()) {
-              snapshotHit = true;
-              // Align _lastSnapshotSeq to prevent unnecessary rewrite on first idle
-              this._lastSnapshotSeq = this._lastProcessedSeq;
-
-              // Fix: idle snapshot hit → phase must be "idle", not "ready"
-              if (isIdleSnap) this._setPhase("idle");
-
-              // Desktop idle: incremental catchup (no WS available)
-              if (isIdleSnap && getTransport().isDesktop()) {
-                const catchupEvents = await api.getBusEvents(id, this._lastProcessedSeq);
-                if (gen !== this._loadGen) return;
-                if (catchupEvents.length > 0) {
-                  dbg("store", "idle snapshot catchup", { count: catchupEvents.length });
-                  const catchupMs = await this.applyEventBatchAsync(catchupEvents, {
-                    replayOnly: false,
-                    isStale: () => gen !== this._loadGen,
-                  });
-                  // Stale (catchupMs === null) means a newer load owns the store —
-                  // do NOT touch _isLoadingReplay; the new owner manages it.
-                  if (catchupMs === null) return;
-                  const catchupSt = this.run?.status;
-                  if (
-                    catchupSt === "idle" ||
-                    catchupSt === "completed" ||
-                    catchupSt === "failed" ||
-                    catchupSt === "stopped"
-                  ) {
-                    this._saveSnapshotToIdb(id);
-                  }
-                }
-              } else if (isIdleSnap) {
-                this._wsSubscribeWithSeq(id, this._lastProcessedSeq);
-              }
-              // Terminal: no catchup needed, just subscribe for WS if applicable
-              if (!isIdleSnap) {
-                this._wsSubscribeWithSeq(id, this._lastProcessedSeq);
-              }
-            } else {
-              // Shape validation failed, or _tryApplySnapshot succeeded but the restored
-              // timeline was corrupt (assistant turns dropped — see
-              // _restoredSnapshotIsUsable). In the corrupt case the store was already
-              // mutated by the partial restore, so reset it and drop the bad snapshot;
-              // the replay path below then rebuilds from the event log and rewrites a
-              // correct snapshot.
-              if (this.timeline.length > 0 || this._seenMessageIds.size > 0) {
-                dbgWarn(
-                  "store",
-                  "snapshot corrupt (timeline missing assistant turns) — discarding for full replay",
-                  { id },
-                );
-                this._clearContentState();
-                this._useChatTimelineForRun =
-                  this.run!.execution_path === "session_actor" ||
-                  (this.run!.execution_path === "pipe_exec" &&
-                    !isTerminal &&
-                    !!this.run!.conversation_ref);
-                snapshotCache.deleteSnapshot(id).catch(() => {});
-              }
-              snapshotBody = null; // fall through to the miss/replay path
-            }
-          }
-        }
-
-        if (!snapshotHit) {
-          // Miss or snapshot corrupted → normal path
-          const busEvents = await api.getBusEvents(id);
-          if (gen !== this._loadGen) {
-            dbg("store", "stale after getBusEvents, gen=", gen);
-            return;
-          }
-          const ms = await this.applyEventBatchAsync(busEvents, {
-            replayOnly: isTerminal,
-            isStale: () => gen !== this._loadGen,
-          });
-          // Stale: a newer load owns the store; do not touch _isLoadingReplay.
-          if (ms === null) return;
-          reducerMs = ms;
-          this._wsSubscribeAfterLoad(id, busEvents);
-          // Write guard: distinguish "legit empty session" from "reducer anomaly"
-          if (snapshotEligible && (this.timeline.length > 0 || busEvents.length === 0)) {
-            this._saveSnapshotToIdb(id);
-          }
-        }
-
-        this._isLoadingReplay = false;
-        dbg("store", "loadRun", {
-          total: Math.round(performance.now() - loadStart),
-          snapshotHit,
-          reducer: Math.round(reducerMs),
-          entries: this.timeline.length,
-        });
-      } else if (this.caps.supportsBusEvents) {
-        // Codex bus-events path: try bus-events, fall back to terminal
-        const busEvents = await api.getBusEvents(id);
-        if (gen !== this._loadGen) {
-          dbg("store", "stale after getBusEvents (codex), gen=", gen);
-          return;
-        }
-        let reducerMs = 0;
-        if (busEvents.length > 0) {
-          this._useChatTimelineForRun = true;
-          // Always replayOnly for loadRun — these are persisted historical events.
-          // Live events arrive via WS subscription (set up below).
-          reducerMs = this.applyEventBatch(busEvents, { replayOnly: true });
-        } else if (!isTerminal && this.run?.conversation_ref?.kind === "codex_thread") {
-          // Active Phase 2 run with no bus-events yet (just started) → timeline, wait for real-time
-          this._useChatTimelineForRun = true;
-        } else {
-          // Terminal run with no bus-events OR active Phase 1 run (no conversation_ref) → terminal
-          this._useChatTimelineForRun = false;
-          // Replay terminal history (same as legacy branch below)
-          if (xtermRef) {
-            const termEvents = await api.getRunEvents(id);
-            if (gen !== this._loadGen) return;
-            replayTerminalEvents(termEvents, xtermRef, this.isRunning);
-          }
-        }
-        // Non-terminal Phase 2 runs must subscribe regardless of history
-        if (!isTerminal && this._useChatTimelineForRun) {
-          this._wsSubscribeAfterLoad(id, busEvents);
-        }
-        this._isLoadingReplay = false;
-        dbg("store", "loadRun (codex bus)", {
-          events: busEvents.length,
-          reducer: Math.round(reducerMs),
-          timeline: this._useChatTimelineForRun,
-        });
-      } else {
-        this._isLoadingReplay = false;
-        // CLI mode: replay history in terminal
-        const events = await api.getRunEvents(id);
-        if (gen !== this._loadGen) {
-          dbg("store", "stale after getRunEvents, gen=", gen);
-          return;
-        }
-        if (xtermRef) {
-          replayTerminalEvents(events, xtermRef, this.isRunning);
-        }
+      const restored = isTerminal
+        ? await this._loadLatestHistory(id, () => gen !== this._loadGen).then((summary) =>
+            summary ? { summary, catchupCount: 0 } : null,
+          )
+        : await this._loadHistoryWithCatchup(id, () => gen !== this._loadGen, false);
+      if (!restored) return false;
+      const { summary, catchupCount } = restored;
+      const pageEntries = this.timeline.length;
+      this._useChatTimelineForRun = true;
+      snapshotCache.deleteSnapshot(id).catch(() => {});
+      await this._wsSubscribeWithSeq(id, this._lastProcessedSeq);
+      if (gen !== this._loadGen || this.run?.id !== id) {
+        dbg("store", "stale after WS subscribe", { id, gen });
+        this._cancelWsSubscriptionIfInactive(id);
+        return false;
       }
+      // Keep live and replayed WS events buffered until the server acknowledges that replay and
+      // buffer flush completed for this checkpoint.
+      middleware.finishHistoryLoad(id, this, historyLoadToken, this._lastProcessedSeq);
+      historyLoadReleased = true;
+      this._isLoadingReplay = false;
+      dbg("store", "loadRun paged", {
+        total: Math.round(performance.now() - loadStart),
+        generation: summary.generationId,
+        pageEntries,
+        totalEntries: summary.totalEntries,
+        catchup: catchupCount,
+      });
 
       // After replay, reconcile phase with run.status:
       // bus events may leave phase as "idle"/"running" even though the run
@@ -2152,11 +2362,17 @@ export class SessionStore {
         dbg("store", "restore run model from meta:", this.run.model);
         this.model = this.run.model;
       }
+      return true;
     } catch (e) {
-      if (gen !== this._loadGen) return;
+      if (gen !== this._loadGen) return false;
       this._isLoadingReplay = false;
       this.error = String(e);
       this._setPhase("failed");
+      return false;
+    } finally {
+      if (!historyLoadReleased) {
+        middleware.cancelHistoryLoad(id, this, historyLoadToken);
+      }
     }
   }
 
@@ -2169,7 +2385,9 @@ export class SessionStore {
     cwd: string,
     attachments: Attachment[],
     permissionModeOverride?: string,
-  ): Promise<string> {
+  ): Promise<StartSessionResult> {
+    const operationGen = this._loadGen;
+    const isStale = () => !this._resumeGuard.isMounted || operationGen !== this._loadGen;
     this.error = "";
     this._setPhase("spawning");
     void loadCompletionSoundPref(); // cached; ready before this turn completes (#123)
@@ -2180,6 +2398,7 @@ export class SessionStore {
       // if the user changed settings without navigating away from chat.
       try {
         const freshSettings = await api.getUserSettings();
+        if (isStale()) return { status: "cancelled" };
         if (freshSettings.auth_mode === "api") {
           const freshPid = freshSettings.active_platform_id ?? "anthropic";
           if (freshPid !== this.platformId) {
@@ -2217,6 +2436,7 @@ export class SessionStore {
           } catch {
             /* non-fatal */
           }
+          if (isStale()) return { status: "cancelled" };
 
           if (agentPlanMode) {
             if (this.permissionMode !== "plan") {
@@ -2240,6 +2460,7 @@ export class SessionStore {
       } catch {
         // Non-fatal: fall through with current store values
       }
+      if (isStale()) return { status: "cancelled" };
 
       // Explicitly pass execution_path for Claude (source of truth for run mode).
       // For Codex, defer to the backend: it picks session_actor (app-server transport) vs
@@ -2258,6 +2479,12 @@ export class SessionStore {
         this.platformId || undefined,
         executionPath,
       );
+      if (isStale()) {
+        // startRun already persisted the run. Leave it under backend/run-list ownership while
+        // this stale frontend operation refrains from routing or spawning it.
+        dbg("store", "startSession stale after run creation", { runId: run.id, operationGen });
+        return { status: "cancelled" };
+      }
       this.run = run;
 
       if (this.useStreamSession) {
@@ -2283,6 +2510,10 @@ export class SessionStore {
           this.platformId || undefined,
           permissionModeOverride,
         );
+        if (isStale() || this.run?.id !== run.id) {
+          dbg("store", "startSession stale after CLI spawn", { runId: run.id, operationGen });
+          return { status: "cancelled" };
+        }
         dbg("store", "startSession resolved");
         // phase will be set by run_state bus event
         this._startSpawnTimeout(run.id);
@@ -2307,16 +2538,28 @@ export class SessionStore {
           undefined,
           clientUuid,
         );
+        if (isStale() || this.run?.id !== run.id) {
+          dbg("store", "startSession stale after bus-event spawn", {
+            runId: run.id,
+            operationGen,
+          });
+          return { status: "cancelled" };
+        }
       } else {
         // PipeExec path (Codex): useStreamSession is false iff the freshly
         // created run has execution_path=pipe_exec, so sendChatMessage is the
         // correct IPC. SessionActor runs always go through the branch above.
         this._setPhase("running");
         await api.sendChatMessage(run.id, prompt, attachments.length > 0 ? attachments : undefined);
+        if (isStale() || this.run?.id !== run.id) {
+          dbg("store", "startSession stale after pipe spawn", { runId: run.id, operationGen });
+          return { status: "cancelled" };
+        }
       }
 
-      return run.id;
+      return { status: "success", runId: run.id };
     } catch (e) {
+      if (isStale()) return { status: "cancelled" };
       this.error = String(e);
       this._setPhase("failed");
       throw e;
@@ -2331,8 +2574,14 @@ export class SessionStore {
     // the agent triggers the skill via a {type:"skill"} UserInput item. Live-Codex only (the
     // picker is gated to that); empty/undefined = unchanged behavior for Claude and no-skill sends.
     skills?: { name: string; path: string }[],
-  ): Promise<void> {
-    if (!this.run) return;
+  ): Promise<SendMessageResult> {
+    if (!this.run) return { status: "cancelled" };
+    const targetRunId = this.run.id;
+    const operationGen = this._loadGen;
+    const isStale = () =>
+      !this._resumeGuard.isMounted ||
+      operationGen !== this._loadGen ||
+      this.run?.id !== targetRunId;
     this.error = "";
     // Invalidate idle snapshot — user is sending a new message
     snapshotCache.deleteSnapshot(this.run.id).catch(() => {});
@@ -2356,7 +2605,8 @@ export class SessionStore {
         // through to the normal enqueue path below.) The steered text still shows as a user
         // entry via the optimistic push; the backend does not echo a separate UserMessage.
         this._pushOptimisticUser(text, attachments);
-        await api.steerSession(this.run.id, text);
+        await api.steerSession(targetRunId, text);
+        if (isStale()) return { status: "cancelled" };
         dbg("store", "codex mid-turn steer", { len: text.length });
       } else if (this.useStreamSession && this.sessionAlive) {
         // Optimistic user message — matches the pattern in startSession().
@@ -2364,16 +2614,17 @@ export class SessionStore {
         // when the backend's UserMessage bus event arrives.
         this._pushOptimisticUser(text, attachments);
         await api.sendSessionMessage(
-          this.run.id,
+          targetRunId,
           text,
           mapAttachments(attachments) ?? undefined,
           hasSkills ? skills : undefined,
         );
+        if (isStale()) return { status: "cancelled" };
         if (hasSkills) dbg("skills", "store send with skills", { count: skills!.length });
         if (this.isKnownSlashCommand(text)) {
           dbg("store", "skip response timeout for slash command", { cmd: text.split(" ")[0] });
         } else {
-          this._startResponseTimeout(this.run.id);
+          this._startResponseTimeout(targetRunId);
         }
       } else if (this.useStreamSession && this.run.agent === "codex") {
         // Stopped Codex app-server session (user clicked Stop, then sent a new message):
@@ -2386,17 +2637,24 @@ export class SessionStore {
         this._pushOptimisticUser(text, attachments);
         if (this.run) this.run = { ...this.run, status: "running" };
         const mw = getEventMiddleware();
-        mw.subscribeCurrent(this.run!.id, this);
-        this._wsSubscribeNewSession(this.run!.id);
+        mw.subscribeCurrent(targetRunId, this);
+        this._wsSubscribeNewSession(targetRunId);
         await api.startSession(
-          this.run!.id,
+          targetRunId,
           undefined,
           undefined,
           text,
           mapAttachments(attachments) ?? undefined,
           this.platformId || undefined,
         );
-        this._startSpawnTimeout(this.run!.id);
+        if (isStale()) {
+          dbg("store", "stopped Codex restart stale after CLI spawn", {
+            runId: targetRunId,
+            operationGen,
+          });
+          return { status: "cancelled" };
+        }
+        this._startSpawnTimeout(targetRunId);
       } else if (
         !this.useStreamSession &&
         this.caps.supportsBusEvents &&
@@ -2406,18 +2664,19 @@ export class SessionStore {
         if (!this._useChatTimelineForRun) {
           this._useChatTimelineForRun = true;
           const mw = getEventMiddleware();
-          mw.subscribeCurrent(this.run!.id, this);
-          this._wsSubscribeNewSession(this.run!.id);
+          mw.subscribeCurrent(targetRunId, this);
+          this._wsSubscribeNewSession(targetRunId);
         }
         const clientUuid = this._pushOptimisticUser(text, attachments);
         this._setPhase("running");
         await api.sendChatMessage(
-          this.run!.id,
+          targetRunId,
           text,
           attachments.length > 0 ? attachments : undefined,
           undefined,
           clientUuid,
         );
+        if (isStale()) return { status: "cancelled" };
       } else if (this.useStreamSession) {
         // Dead session_actor that's NOT a resumable Codex run (e.g. a stopped Claude
         // process): routing to sendChatMessage would be rejected (pipe_exec only), so
@@ -2428,12 +2687,15 @@ export class SessionStore {
         // PipeExec (Codex): one-shot process per message, no liveness concept.
         this._setPhase("running");
         await api.sendChatMessage(
-          this.run.id,
+          targetRunId,
           text,
           attachments.length > 0 ? attachments : undefined,
         );
+        if (isStale()) return { status: "cancelled" };
       }
+      return { status: "success" };
     } catch (e) {
+      if (isStale()) return { status: "cancelled" };
       this.error = String(e);
       throw e;
     }
@@ -2516,6 +2778,28 @@ export class SessionStore {
     return this._resumeGuard.busy;
   }
 
+  /** Invalidate an in-flight resume/fork before UI cancellation starts awaiting cleanup I/O. */
+  cancelResumeOperation(): void {
+    this._loadGen++;
+    this._clearSpawnTimeout();
+    this._clearResponseTimeout();
+    dbg("store", "resume operation cancelled", { generation: this._loadGen });
+  }
+
+  /** Invalidate async work when the URL moves away from the run currently owned by this store. */
+  invalidateOperationsForRoute(routeRunId: string): boolean {
+    if (routeRunId === (this.run?.id ?? "")) return false;
+    this._loadGen++;
+    this._clearSpawnTimeout();
+    this._clearResponseTimeout();
+    dbg("store", "operations invalidated by route change", {
+      routeRunId,
+      storeRunId: this.run?.id ?? "",
+      generation: this._loadGen,
+    });
+    return true;
+  }
+
   /** Resume/continue/fork a finished session. Returns the target run ID.
    *  Avoids flash by NOT calling reset() — clears content fields individually
    *  and uses replayOnly=true so replay doesn't overwrite phase.
@@ -2526,12 +2810,15 @@ export class SessionStore {
     mode: SessionMode,
     initialMessage?: string,
     attachments?: Attachment[],
-  ): Promise<string | null> {
-    if (!this._resumeGuard.acquire()) return null;
+  ): Promise<ResumeSessionResult> {
+    if (!this._resumeGuard.acquire()) return { status: "cancelled" };
+    let operationGen = this._loadGen;
 
     try {
       let run = await api.getRun(runId);
-      if (!this._resumeGuard.isMounted) return runId;
+      if (!this._resumeGuard.isMounted || operationGen !== this._loadGen) {
+        return { status: "cancelled" };
+      }
 
       let metaActive = ACTIVE_PHASES.includes(run.status as SessionPhase);
       if (metaActive && mode !== "fork") {
@@ -2550,6 +2837,9 @@ export class SessionStore {
         } catch (e) {
           dbgWarn("store", "resumeSession: stop attempt failed:", e);
         }
+        if (!this._resumeGuard.isMounted || operationGen !== this._loadGen) {
+          return { status: "cancelled" };
+        }
         if (metaActive) {
           // Still running after stop attempt — genuinely active, can't resume
           throw new Error("Session is still running");
@@ -2563,26 +2853,11 @@ export class SessionStore {
       // Invalidate any concurrent loadRun, then snapshot the gen for our own
       // stale-check (a later loadRun would bump _loadGen and we'd see the change).
       const loadGen = ++this._loadGen;
+      operationGen = loadGen;
       const resumeT0 = performance.now();
 
       // ★ Phase 1: async data fetch BEFORE clearing state (avoids flash)
       const isStream = run.execution_path === "session_actor"; // run-level, not agent identity
-      let snapshotBody: string | null = null;
-      let busEvents: BusEvent[] = [];
-
-      if (isStream) {
-        try {
-          snapshotBody = await snapshotCache.readSnapshot(runId, run.status);
-        } catch {
-          /* IDB unavailable */
-        }
-        if (!this._resumeGuard.isMounted) return runId;
-        if (!snapshotBody) {
-          busEvents = await api.getBusEvents(runId);
-          if (!this._resumeGuard.isMounted) return runId;
-          dbg("store", "resumeSession: fetched", busEvents.length, "bus events for replay");
-        }
-      }
 
       // ★ Phase 2: clear + set run metadata (sync frame, no await)
       this.run = run;
@@ -2591,39 +2866,26 @@ export class SessionStore {
       this._clearContentState();
       this._useChatTimelineForRun = true; // resumeSession is always Claude stream path
 
-      // ★ Phase 3: apply snapshot or events + force invalidate
-      let reducerMs = 0;
-      let snapshotHit = false;
+      // ★ Phase 3: restore only the latest bounded history page.
       if (isStream) {
-        if (snapshotBody && this._tryApplySnapshot(snapshotBody)) {
-          snapshotHit = true;
-          this._wsSubscribeWithSeq(runId, this._lastProcessedSeq);
-        } else {
-          // Fallback: snapshot corrupted → re-fetch events if needed
-          if (!busEvents.length && snapshotBody) {
-            busEvents = await api.getBusEvents(runId);
-            if (!this._resumeGuard.isMounted) return runId;
-          }
-          if (busEvents.length > 0) {
-            const ms = await this.applyEventBatchAsync(busEvents, {
-              replayOnly: true,
-              isStale: () => !this._resumeGuard.isMounted || loadGen !== this._loadGen,
-            });
-            if (ms === null) return runId;
-            reducerMs = ms;
-          }
-          // Always subscribe — even empty history needs real-time events
-          this._wsSubscribeAfterLoad(runId, busEvents);
+        const restored = await this._loadHistoryWithCatchup(
+          runId,
+          () => !this._resumeGuard.isMounted || loadGen !== this._loadGen,
+          true,
+        );
+        if (!restored) return { status: "cancelled" };
+        await this._wsSubscribeWithSeq(runId, this._lastProcessedSeq);
+        if (!this._resumeGuard.isMounted || loadGen !== this._loadGen || this.run?.id !== runId) {
+          dbg("store", "resume stale after WS subscribe", { runId, loadGen });
+          this._cancelWsSubscriptionIfInactive(runId);
+          return { status: "cancelled" };
         }
-
         // Resume makes session go live → old snapshot is always stale
         snapshotCache.deleteSnapshot(runId).catch(() => {});
       }
 
       dbg("store", "resumeSession", {
         total: Math.round(performance.now() - resumeT0),
-        snapshotHit,
-        reducer: Math.round(reducerMs),
         entries: this.timeline.length,
       });
 
@@ -2667,6 +2929,13 @@ export class SessionStore {
           backendAtt,
           run.platform_id ?? undefined,
         );
+        if (!this._resumeGuard.isMounted || loadGen !== this._loadGen || this.run?.id !== runId) {
+          // startSession has transferred ownership to the backend. Do not stop here: a newer
+          // operation may intentionally own the same run. The runs list remains the source of
+          // truth while this stale frontend operation refrains from installing timers/routing.
+          dbg("store", "resume stale after CLI spawn", { runId, loadGen });
+          return { status: "cancelled" };
+        }
       }
       // Bus events via applyEvent (live) will transition phase:
       // - With message: spawning → running → idle (from CLI result)
@@ -2686,13 +2955,15 @@ export class SessionStore {
         // No initialMessage → no response timeout (just waiting for user input)
       }
 
-      return targetRunId;
+      return { status: "success", runId: targetRunId };
     } catch (e) {
-      if (!this._resumeGuard.isMounted) return null;
+      if (!this._resumeGuard.isMounted || operationGen !== this._loadGen) {
+        return { status: "cancelled" };
+      }
       this.error = String(e);
       this._setPhase("failed");
       dbgWarn("store", "resumeSession failed:", e);
-      return null;
+      return { status: "failed" };
     } finally {
       this._resumeGuard.release();
     }
@@ -2710,10 +2981,14 @@ export class SessionStore {
 
     // Step 1: One-shot fork (backend does fork_oneshot, returns new run_id with new session_id)
     const newRunId = await api.forkSession(runId);
-    if (!this._resumeGuard.isMounted) throw new Error("Unmounted during fork");
+    if (!this._resumeGuard.isMounted || loadGen !== this._loadGen) {
+      throw new Error("Stale during fork creation");
+    }
 
     const newRun = await api.getRun(newRunId);
-    if (!this._resumeGuard.isMounted) throw new Error("Unmounted during fork");
+    if (!this._resumeGuard.isMounted || loadGen !== this._loadGen) {
+      throw new Error("Stale during fork metadata load");
+    }
 
     this.run = newRun;
 
@@ -2723,27 +2998,20 @@ export class SessionStore {
     this._clearContentState();
     this._useChatTimelineForRun = true;
 
-    // Replay copied parent events for immediate display.
-    // Subscribe to live events AFTER replay so a live applyEvent during chunked
-    // replay can't slip in and be overwritten by `_commitReduceCtx` snapshotting
-    // a now-stale `this.timeline`.
-    const allForkEvents = await api.getBusEvents(newRunId);
-    if (!this._resumeGuard.isMounted) throw new Error("Unmounted during fork");
-    const newEvents = allForkEvents.filter((ev) => ev.run_id === newRunId);
-    if (newEvents.length > 0) {
-      dbg("store", "fork: replaying", newEvents.length, "parent events");
-      const ms = await this.applyEventBatchAsync(newEvents, {
-        replayOnly: true,
-        isStale: () => !this._resumeGuard.isMounted || loadGen !== this._loadGen,
-      });
-      // Match the existing fork pattern (line ~2157): treat a stale/unmount
-      // mid-replay as a fatal interruption so the caller's catch path runs.
-      if (ms === null) throw new Error("Stale during fork replay");
-    }
+    const restored = await this._loadHistoryWithCatchup(
+      newRunId,
+      () => !this._resumeGuard.isMounted || loadGen !== this._loadGen,
+      true,
+    );
+    if (!restored) throw new Error("Stale during fork history load");
     // Subscribe to NEW run — live events from stream-json will route here.
     getEventMiddleware().subscribeCurrent(newRunId, this);
     dbg("store", "fork: middleware subscribed to new run", newRunId);
-    this._wsSubscribeAfterLoad(newRunId, allForkEvents);
+    await this._wsSubscribeWithSeq(newRunId, this._lastProcessedSeq);
+    if (!this._resumeGuard.isMounted || loadGen !== this._loadGen || this.run?.id !== newRunId) {
+      this._cancelWsSubscriptionIfInactive(newRunId);
+      throw new Error("Stale after fork WS subscribe");
+    }
 
     // Step 2 (stream-json resume) is NOT started here.
     // handleResume will dismiss the overlay first, then call connectSession()
@@ -2766,43 +3034,73 @@ export class SessionStore {
     dbg("store", "connectSession: establishing stream-json connection", { runId, sessionId: sid });
     this._wsSubscribeNewSession(runId);
     this._setPhase("spawning");
-    await api.startSession(
-      runId,
-      "resume",
-      sid,
-      undefined,
-      undefined,
-      this.platformId || undefined,
-    );
+    const loadGen = this._loadGen;
+    try {
+      await api.startSession(
+        runId,
+        "resume",
+        sid,
+        undefined,
+        undefined,
+        this.platformId || undefined,
+      );
+    } catch (error) {
+      if (!this._resumeGuard.isMounted || loadGen !== this._loadGen || this.run?.id !== runId) {
+        dbg("store", "connectSession stale after CLI spawn failure", { runId, loadGen });
+        return;
+      }
+      throw error;
+    }
+    if (!this._resumeGuard.isMounted || loadGen !== this._loadGen || this.run?.id !== runId) {
+      dbg("store", "connectSession stale after CLI spawn", { runId, loadGen });
+      return;
+    }
     this._startSpawnTimeout(runId);
   }
 
   // ── WS subscribe helpers (browser-only, no-op on desktop) ──
 
   /** Browser: notify WS server to start pushing real-time events after history load */
-  private _wsSubscribeAfterLoad(runId: string, events: BusEvent[]): void {
+  private async _wsSubscribeAfterLoad(runId: string, events: BusEvent[]): Promise<void> {
+    if (typeof window === "undefined") return;
     if (getTransport().isDesktop()) return;
     const maxSeq =
       events.length > 0
         ? (((events[events.length - 1] as Record<string, unknown>)._seq as number) ?? 0)
         : 0;
-    getTransport().subscribeRun(runId, maxSeq);
+    await getTransport().subscribeRun(runId, maxSeq);
   }
 
   private _wsSubscribeNewSession(runId: string): void {
+    if (typeof window === "undefined") return;
     if (getTransport().isDesktop()) return;
-    getTransport().subscribeRun(runId, 0);
+    void getTransport()
+      .subscribeRun(runId, 0, "live")
+      .catch((error) => dbgWarn("store", "new session WS subscribe failed", { runId, error }));
   }
 
-  private _wsSubscribeWithSeq(runId: string, lastSeq: number): void {
+  private async _wsSubscribeWithSeq(runId: string, lastSeq: number): Promise<void> {
+    if (typeof window === "undefined") return;
     if (getTransport().isDesktop()) return;
-    getTransport().subscribeRun(runId, lastSeq);
+    await getTransport().subscribeRun(runId, lastSeq);
+  }
+
+  private _cancelWsSubscriptionIfInactive(runId: string): void {
+    if (typeof window === "undefined" || getTransport().isDesktop()) return;
+    const middleware = getEventMiddleware();
+    // A newer operation may legitimately subscribe to the same run. Only remove the transport
+    // intent when routing has moved elsewhere, so a stale completion cannot revive the old run.
+    if (middleware.currentRunId !== runId || middleware.currentStore !== this) {
+      getTransport().unsubscribeRun(runId);
+    }
   }
 
   /** Call from page cleanup to prevent stale async writes after unmount. */
   unmountGuards(): void {
     this._resumeGuard.unmount();
+    this._loadGen++;
     this._clearSpawnTimeout();
+    this._clearResponseTimeout();
   }
 
   /** Update MCP servers (e.g. after getMcpStatus refresh). Deduplicates by name. */
@@ -2840,6 +3138,20 @@ export class SessionStore {
     }
   }
 
+  markInteractionResponseFailed(
+    requestId: string,
+    interactionKind: "permission" | "hook" | "elicitation" | "user_input",
+    error: unknown,
+  ): void {
+    this.applyEvent({
+      type: "interaction_response_failed",
+      run_id: this.run?.id ?? "",
+      request_id: requestId,
+      interaction_kind: interactionKind,
+      error: String(error),
+    });
+  }
+
   /** Answer an AskUserQuestion tool.
    *  - Codex (app-server): the tool_use_id IS the pending request id → reply via the
    *    JSON-RPC `respond_user_input` channel (NOT a new user turn).
@@ -2868,9 +3180,6 @@ export class SessionStore {
           .map(([q, a]) => `${q}: ${a}`)
           .join("\n")
       : answer;
-    // Pass the per-question answers so the resolved card highlights each choice.
-    this.resolveAskQuestion(toolUseId, display, multi ? multi.byText : undefined);
-
     if (this.run.agent === "codex") {
       try {
         const answers: Record<string, string[]> = {};
@@ -2881,13 +3190,22 @@ export class SessionStore {
           answers[questions[0]?.id ?? "0"] = [answer];
         }
         await api.respondUserInput(this.run.id, toolUseId, answers);
+        // Durable response events normally converge the card first; this keeps the direct IPC
+        // path responsive when event delivery is delayed.
+        this.resolveAskQuestion(toolUseId, display, multi ? multi.byText : undefined);
       } catch (e) {
         dbgWarn("store", "codex respondUserInput failed:", e);
         this.error = String(e);
+        if (!String(e).includes("[interaction:not_started]")) {
+          this.markInteractionResponseFailed(toolUseId, "user_input", e);
+        }
         throw e;
       }
       return;
     }
+
+    // Claude answers are ordinary follow-up turns, so retain the existing optimistic card update.
+    this.resolveAskQuestion(toolUseId, display, multi ? multi.byText : undefined);
 
     try {
       // Send the user's answer as a follow-up message.
@@ -2907,11 +3225,18 @@ export class SessionStore {
   /** Unified permission resolution: traverses ALL timeline + subTimeline entries
    *  (no early return) to handle duplicate requestId entries from fallback/synthetic sources.
    *  - "deny" → permission_denied
-   *  - "allow" → running (skips AskUserQuestion to avoid double-submit) */
+   *  - "allow" → success for RequestPermissions, running for executable tools
+   *  AskUserQuestion is skipped on allow to avoid double-submit. RequestPermissions has no
+   *  subsequent item lifecycle events, so the approval itself completes that synthetic card. */
   private _resolvePermission(action: "allow" | "deny", requestId: string): void {
     dbg("store", `resolvePermission${action === "allow" ? "Allow" : "Deny"}`, { requestId });
-    const targetStatus = action === "allow" ? ("running" as const) : ("permission_denied" as const);
     const skipAsk = action === "allow";
+    const resolvedStatus = (toolName: string) =>
+      action === "deny"
+        ? ("permission_denied" as const)
+        : toolName === "RequestPermissions"
+          ? ("success" as const)
+          : ("running" as const);
     let changed = false;
     const u = [...this.timeline];
     for (let i = 0; i < u.length; i++) {
@@ -2922,7 +3247,10 @@ export class SessionStore {
         entry.tool.permission_request_id === requestId
       ) {
         if (!(skipAsk && entry.tool.tool_name === "AskUserQuestion")) {
-          u[i] = { ...entry, tool: { ...entry.tool, status: targetStatus } };
+          u[i] = {
+            ...entry,
+            tool: { ...entry.tool, status: resolvedStatus(entry.tool.tool_name) },
+          };
           changed = true;
         }
       }
@@ -2937,7 +3265,10 @@ export class SessionStore {
             sub.tool.permission_request_id === requestId &&
             !(skipAsk && sub.tool.tool_name === "AskUserQuestion")
           ) {
-            newSub[j] = { ...sub, tool: { ...sub.tool, status: targetStatus } };
+            newSub[j] = {
+              ...sub,
+              tool: { ...sub.tool, status: resolvedStatus(sub.tool.tool_name) },
+            };
             subChanged = true;
           }
         }
@@ -2992,13 +3323,11 @@ export class SessionStore {
     return ctx ? ctx.isStream : this.useChatTimeline;
   }
 
-  /**
-   * Resolve stale tool entries to "error" across main timeline and all subTimelines.
-   * Used by idle/spawning/control_cancelled cleanup.
-   */
+  /** Resolve matching tool entries across the main timeline and all subTimelines. */
   private _resolveStaleTools(
     predicate: (tool: BusToolItem) => boolean,
     ctx: ReduceCtx | null,
+    targetStatus: BusToolItem["status"] = "error",
   ): void {
     const tl = ctx ? ctx.tl : this.timeline;
     let cloned = !!ctx; // ctx.tl is already a mutable reference
@@ -3014,7 +3343,7 @@ export class SessionStore {
           this.timeline = [...this.timeline];
           cloned = true;
         }
-        parentUpdated = { ...e, tool: { ...e.tool, status: "error" as const } };
+        parentUpdated = { ...e, tool: { ...e.tool, status: targetStatus } };
         const target = ctx ? ctx.tl : this.timeline;
         target[i] = parentUpdated;
         dbg("store", "resolved stale tool", { id: e.id, name: e.tool.tool_name });
@@ -3033,7 +3362,7 @@ export class SessionStore {
           newSub = [...newSub];
           subChanged = true;
         }
-        newSub[j] = { ...child, tool: { ...child.tool, status: "error" as const } };
+        newSub[j] = { ...child, tool: { ...child.tool, status: targetStatus } };
         dbg("store", "resolved stale sub-tool", { id: child.id, name: child.tool.tool_name });
       }
       if (subChanged) {
@@ -3495,25 +3824,21 @@ export class SessionStore {
             ? ("ask_pending" as const)
             : ev.status === "error"
               ? ("error" as const)
-              : ("success" as const);
+              : ev.status === "rejected"
+                ? ("rejected" as const) // user_rejected_tool_use → terminal rejected
+                : ("success" as const);
+        const updateTool = (tool: BusToolItem): BusToolItem => ({
+          ...tool,
+          status: resolvedStatus,
+          output: ev.output as Record<string, unknown>,
+          duration_ms: ev.duration_ms,
+          tool_name: ev.tool_name || tool.tool_name,
+          tool_use_result: ev.tool_use_result as Record<string, unknown> | undefined,
+        });
 
         // Subagent routing: update child tool inside parent's subTimeline
         if (ev.parent_tool_use_id) {
-          if (
-            this._updateSubTimelineTool(
-              ev.parent_tool_use_id,
-              ev.tool_use_id,
-              (t) => ({
-                ...t,
-                status: resolvedStatus,
-                output: ev.output as Record<string, unknown>,
-                duration_ms: ev.duration_ms,
-                tool_name: ev.tool_name || t.tool_name,
-                tool_use_result: ev.tool_use_result as Record<string, unknown> | undefined,
-              }),
-              ctx,
-            )
-          ) {
+          if (this._updateSubTimelineTool(ev.parent_tool_use_id, ev.tool_use_id, updateTool, ctx)) {
             break;
           }
           dbgWarn(
@@ -3522,6 +3847,8 @@ export class SessionStore {
             { parent: ev.parent_tool_use_id, tool: ev.tool_use_id },
           );
           // fall through to main timeline logic
+        } else if (this._updateToolInAnySubTimeline(ev.tool_use_id, updateTool, ctx)) {
+          break;
         }
 
         const tl = getTl();
@@ -3606,7 +3933,9 @@ export class SessionStore {
         // Subagent EnterPlanMode should not change the parent session's mode.
         // replayOnly guard: replaying a historical session that ended mid-plan must not
         // pollute the current permissionMode (which is a user-level preference, not snapshot state).
-        if (!replayOnly && ev.status !== "error" && !ev.parent_tool_use_id) {
+        // Whitelist "success" only — a rejected EnterPlanMode/ExitPlanMode (e.g. interrupted
+        // via quarantine) must not flip the mode.
+        if (!replayOnly && ev.status === "success" && !ev.parent_tool_use_id) {
           if (ev.tool_name === "EnterPlanMode") {
             this.previousPermissionMode = this.permissionMode || "default";
             this.permissionMode = "plan";
@@ -3893,11 +4222,11 @@ export class SessionStore {
               ev.tool_use_id,
               (t) => ({
                 ...t,
+                input: ev.tool_input as Record<string, unknown>,
                 status: "permission_prompt" as const,
                 permission_request_id: ev.request_id,
-                ...(ev.suggestions && ev.suggestions.length > 0
-                  ? { suggestions: ev.suggestions }
-                  : {}),
+                permission_reason: ev.decision_reason,
+                suggestions: ev.suggestions ?? [],
               }),
               ctx,
             )
@@ -3921,12 +4250,11 @@ export class SessionStore {
             ...old,
             tool: {
               ...old.tool,
+              input: ev.tool_input as Record<string, unknown>,
               status: "permission_prompt",
               permission_request_id: ev.request_id,
-              // Merge suggestions from permission_prompt event (CLI provides these)
-              ...(ev.suggestions && ev.suggestions.length > 0
-                ? { suggestions: ev.suggestions }
-                : {}),
+              permission_reason: ev.decision_reason,
+              suggestions: ev.suggestions ?? [],
             },
           };
           if (ctx) {
@@ -3947,11 +4275,11 @@ export class SessionStore {
             ev.tool_use_id,
             (t) => ({
               ...t,
+              input: ev.tool_input as Record<string, unknown>,
               status: "permission_prompt" as const,
               permission_request_id: ev.request_id,
-              ...(ev.suggestions && ev.suggestions.length > 0
-                ? { suggestions: ev.suggestions }
-                : {}),
+              permission_reason: ev.decision_reason,
+              suggestions: ev.suggestions ?? [],
             }),
             ctx,
           );
@@ -3972,9 +4300,8 @@ export class SessionStore {
                 input: ev.tool_input as Record<string, unknown>,
                 status: "permission_prompt",
                 permission_request_id: ev.request_id,
-                ...(ev.suggestions && ev.suggestions.length > 0
-                  ? { suggestions: ev.suggestions }
-                  : {}),
+                permission_reason: ev.decision_reason,
+                suggestions: ev.suggestions ?? [],
               },
               ts: eventTs(ev),
             };
@@ -4062,6 +4389,7 @@ export class SessionStore {
           mode: ev.mode,
           url: ev.url,
           requestedSchema: ev.requested_schema,
+          responseStatus: "pending",
         });
         this.pendingElicitations = updated;
         break;
@@ -4294,17 +4622,22 @@ export class SessionStore {
       }
 
       case "control_cancelled": {
-        // Resolve any permission_prompt or optimistic-running tool with matching request_id to "error"
+        // Cancellation follows a durable response_started fact, so live and catch-up replay must
+        // accept the non-retryable intermediate state as well as the original prompt state.
         // Covers both main timeline and subTimelines.
         this._resolveStaleTools(
           (t) =>
-            (t.status === "permission_prompt" || t.status === "running") &&
+            (t.status === "permission_prompt" ||
+              t.status === "running" ||
+              t.status === "response_pending") &&
             t.permission_request_id === ev.request_id,
           ctx,
+          "error",
         );
-        // Also resolve pending hook callbacks
+        // Also resolve hook callbacks after either the prompt or response_started event.
         this.hookEvents = this.hookEvents.map((h) =>
-          h.request_id === ev.request_id && h.status === "hook_pending"
+          h.request_id === ev.request_id &&
+          (h.status === "hook_pending" || h.status === "responding")
             ? { ...h, status: "cancelled" as const }
             : h,
         );
@@ -4313,6 +4646,91 @@ export class SessionStore {
           const elicUpdated = new Map(this.pendingElicitations);
           elicUpdated.delete(ev.request_id);
           this.pendingElicitations = elicUpdated;
+        }
+        this._resolveStaleTools(
+          (tool) =>
+            tool.tool_use_id === ev.request_id &&
+            tool.tool_name === "AskUserQuestion" &&
+            (tool.status === "ask_pending" || tool.status === "response_pending"),
+          ctx,
+          "error",
+        );
+        break;
+      }
+
+      case "interaction_response_started":
+      case "interaction_response_failed":
+      case "interaction_resolved": {
+        // A summary can be published after the prompt but before this source event. Catch-up must
+        // therefore converge cards restored from that summary, even though live responses already
+        // update the same UI optimistically.
+        const resolution = "resolution" in ev ? ev.resolution : undefined;
+        const failed = ev.type === "interaction_response_failed";
+        const started = ev.type === "interaction_response_started";
+        if (!ev.interaction_kind || ev.interaction_kind === "permission") {
+          const status = failed
+            ? ("response_failed" as const)
+            : started
+              ? ("response_pending" as const)
+              : resolution === "deny"
+                ? ("permission_denied" as const)
+                : ("running" as const);
+          this._resolveStaleTools(
+            (tool) =>
+              tool.permission_request_id === ev.request_id &&
+              (tool.status === "permission_prompt" ||
+                tool.status === "running" ||
+                tool.status === "response_pending"),
+            ctx,
+            status,
+          );
+        }
+        if (!ev.interaction_kind || ev.interaction_kind === "hook") {
+          this.hookEvents = this.hookEvents.map((h) =>
+            h.request_id === ev.request_id &&
+            (h.status === "hook_pending" || h.status === "responding")
+              ? {
+                  ...h,
+                  status: failed
+                    ? ("error" as const)
+                    : started
+                      ? ("responding" as const)
+                      : resolution === "allow"
+                        ? ("allowed" as const)
+                        : resolution === "deny" || resolution === "defer"
+                          ? ("denied" as const)
+                          : ("resolved" as const),
+                }
+              : h,
+          );
+        }
+        if (!ev.interaction_kind || ev.interaction_kind === "elicitation") {
+          if (this.pendingElicitations.has(ev.request_id)) {
+            const updated = new Map(this.pendingElicitations);
+            if (ev.type === "interaction_resolved") {
+              updated.delete(ev.request_id);
+            } else {
+              const existing = updated.get(ev.request_id)!;
+              updated.set(ev.request_id, {
+                ...existing,
+                responseStatus: failed ? "error" : "responding",
+                ...(failed ? { responseError: ev.error } : {}),
+              });
+            }
+            this.pendingElicitations = updated;
+          }
+        }
+        if (ev.interaction_kind === "user_input") {
+          this._resolveStaleTools(
+            (tool) =>
+              tool.tool_use_id === ev.request_id &&
+              tool.tool_name === "AskUserQuestion" &&
+              (tool.status === "ask_pending" ||
+                tool.status === "response_pending" ||
+                tool.status === "success"),
+            ctx,
+            failed ? "response_failed" : started ? "response_pending" : "success",
+          );
         }
         break;
       }
@@ -4477,6 +4895,30 @@ export class SessionStore {
         // Cleared at the next turn start (run_state→running) and on reset.
         dbg("store", "codex_turn_diff", { len: ev.diff.length });
         this.turnDiff = ev.diff;
+        break;
+      }
+
+      case "codex_agent_info": {
+        dbg("store", "codex_agent_info", {
+          threadId: ev.thread_id,
+          nickname: ev.nickname,
+          role: ev.role,
+        });
+        const next = {
+          ...(ctx ? ctx.codexAgentInfo : this.codexAgentInfo),
+          [ev.thread_id]: {
+            nickname: ev.nickname,
+            role: ev.role,
+            parentThreadId: ev.parent_thread_id,
+          },
+        };
+        if (ctx) {
+          ctx.codexAgentInfo = next;
+          ctx.codexAgentInfoDirty = true;
+        } else {
+          this.codexAgentInfo = next;
+          this._codexAgentInfoVersion++;
+        }
         break;
       }
 

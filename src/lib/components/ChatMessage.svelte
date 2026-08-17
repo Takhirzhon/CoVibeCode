@@ -5,7 +5,8 @@
   import FileAttachment from "./FileAttachment.svelte";
   import { imageViewer } from "$lib/stores/image-viewer.svelte";
   import { IMAGE_TYPES } from "$lib/utils/file-types";
-  import type { ChatMessage, Attachment } from "$lib/types";
+  import type { ChatMessage, Attachment, HistoryContent } from "$lib/types";
+  import HistoryContentPager from "./HistoryContentPager.svelte";
 
   let {
     message,
@@ -13,12 +14,20 @@
     thinkingText,
     onRewind,
     agent = "claude",
+    historyContent,
+    thinkingHistoryContent,
+    historyRunId,
+    historyGenerationId,
   }: {
     message: ChatMessage;
     attachments?: Attachment[];
     thinkingText?: string;
     onRewind?: () => void;
     agent?: string;
+    historyContent?: HistoryContent;
+    thinkingHistoryContent?: HistoryContent;
+    historyRunId?: string;
+    historyGenerationId?: string;
   } = $props();
 
   const assistantLabel = $derived(agent === "codex" ? "Codex" : t("chat_roleClaude"));
@@ -256,11 +265,26 @@
             >
               {thinkingText.trimEnd()}
             </div>
+            {#if thinkingHistoryContent && historyRunId && historyGenerationId}
+              <HistoryContentPager
+                runId={historyRunId}
+                generationId={historyGenerationId}
+                content={thinkingHistoryContent}
+                label={t("historyContent_thinking")}
+              />
+            {/if}
           {/if}
         {/if}
         <div class="prose-chat">
           <MarkdownContent text={message.content} />
         </div>
+      {/if}
+      {#if historyContent && historyRunId && historyGenerationId}
+        <HistoryContentPager
+          runId={historyRunId}
+          generationId={historyGenerationId}
+          content={historyContent}
+        />
       {/if}
     </div>
   </div>

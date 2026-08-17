@@ -654,6 +654,7 @@ mod tests {
     fn make_user_settings() -> UserSettings {
         UserSettings {
             default_agent: "claude".to_string(),
+            claude_path: None,
             default_model: None,
             allowed_tools: vec![],
             working_directory: None,
@@ -681,7 +682,7 @@ mod tests {
             web_server_tunnel_url: None,
             task_completion_sound_enabled: None,
             task_completion_sound: None,
-            claude_path: None,
+            timeout_minutes: None,
             updated_at: String::new(),
         }
     }

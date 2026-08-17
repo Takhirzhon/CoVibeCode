@@ -76,15 +76,9 @@ pub struct SyncResult {
 
 // ── Shared helpers ──────────────────────────────────────────────────
 
-/// Encode cwd for Claude CLI directory naming: ':' '/' and '\' → '-'.
-///
-/// Mirrors Claude Code's project-dir scheme, which also collapses the Windows
-/// drive colon (e.g. `C:\Users\a` → `C--Users-a`, on disk as
-/// `~/.claude/projects/C--Users-a/`). This is only a fast-path optimization —
-/// callers fall back to a full scan when the encoded dir is absent, so paths
-/// containing other characters Claude rewrites (spaces, dots) still resolve.
+/// Encode cwd for Claude CLI directory naming: '/' and '\' → '-'.
 pub fn encode_cwd(cwd: &str) -> String {
-    cwd.replace([':', '/', '\\'], "-")
+    cwd.replace(['/', '\\'], "-")
 }
 
 /// Normalize a working directory for cross-platform equality comparison.

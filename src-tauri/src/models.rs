@@ -291,6 +291,9 @@ pub struct UserSettings {
     /// claude-tap script). Empty/None = auto-detect. (#155)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_path: Option<String>,
+    /// User turn hard-timeout in minutes. None = default (30 min), Some(0) = disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_minutes: Option<u64>,
     pub updated_at: String,
 }
 
@@ -411,6 +414,7 @@ impl Default for UserSettings {
             task_completion_sound_enabled: None,
             task_completion_sound: None,
             claude_path: None,
+            timeout_minutes: None,
             updated_at: now_iso(),
         }
     }
@@ -1418,6 +1422,17 @@ pub enum BusEvent {
         turn_id: String,
         diff: String,
     },
+    /// Identity metadata resolved for a spawned Codex thread through `thread/read`.
+    CodexAgentInfo {
+        run_id: String,
+        thread_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        nickname: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent_thread_id: Option<String>,
+    },
     /// Tool use summary — top-level event type "tool_use_summary".
     ToolUseSummary {
         run_id: String,
@@ -1448,6 +1463,32 @@ pub enum BusEvent {
     },
     /// CLI cancelled a pending control_request (e.g. cancelled permission prompt).
     ControlCancelled { run_id: String, request_id: String },
+    /// Durable intent written before an interactive response is sent to the CLI.
+    /// Recovery treats this as non-retryable because a process can die after the wire write.
+    InteractionResponseStarted {
+        run_id: String,
+        request_id: String,
+        interaction_kind: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        resolution: Option<String>,
+    },
+    /// The CLI response write failed after its durable intent was recorded.
+    InteractionResponseFailed {
+        run_id: String,
+        request_id: String,
+        interaction_kind: String,
+        error: String,
+    },
+    /// The app successfully delivered a response for an interactive control request.
+    /// Persisted separately from cancellation so history rebuilds do not restore answered cards.
+    InteractionResolved {
+        run_id: String,
+        request_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        interaction_kind: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        resolution: Option<String>,
+    },
     /// Output from a CLI slash command (e.g. /context, /cost).
     /// Extracted from `<local-command-stdout>` tags in user messages.
     CommandOutput { run_id: String, content: String },

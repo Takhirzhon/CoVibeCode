@@ -30,7 +30,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -80,9 +80,100 @@ fn truncate_str(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
+fn pending_kind_name(kind: PendingKind) -> &'static str {
+    match kind {
+        PendingKind::Permission => "permission",
+        PendingKind::Hook => "hook",
+        PendingKind::Elicitation => "elicitation",
+        PendingKind::UserInput => "user_input",
+    }
+}
+
+fn ensure_control_cancel_supported(is_codex: bool) -> Result<(), String> {
+    if is_codex {
+        // Codex app-server has no stream-json control_cancel_request frame; emitting the Claude
+        // shape would be ignored while leaving the JSON-RPC request pending.
+        Err(
+            "[interaction:not_started] cancel_control_request is unsupported for Codex app-server"
+                .to_string(),
+        )
+    } else {
+        Ok(())
+    }
+}
+
+async fn write_json_line_to<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    payload: &Value,
+    context: &str,
+) -> Result<(), String> {
+    let mut line = serde_json::to_string(payload).map_err(|e| e.to_string())?;
+    line.push('\n');
+    writer
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|e| format!("{} write failed: {}", context, e))?;
+    writer
+        .flush()
+        .await
+        .map_err(|e| format!("{} flush failed: {}", context, e))
+}
+
 /// Build a control_response payload for the CLI. HC#2: the `request_id` MUST be nested
 /// inside `response`, not at the top level. `Ok` → success with a response body; `Err` →
 /// error with a message (the correct reply for a request the app cannot fulfill).
+/// Decide whether a mapped event must reach the frontend while the actor is in
+/// quarantine. RunState turn-boundary events are handled separately (they lift
+/// the quarantine); everything else is suppressed as mid-turn noise — except
+/// ToolEnd: the interrupted tool must terminate in the chat tree, or its card
+/// stays "running" forever after a quarantine interrupt.
+fn quarantine_event_passthrough(event: &BusEvent) -> bool {
+    matches!(event, BusEvent::ToolEnd { .. })
+}
+
+/// Quarantine-lift recovery decision for a user turn. Returns
+/// (emit_state, clear_pending_interrupt, emit_error).
+///
+/// Internal turns emit nothing — the frontend never saw the turn start, so an
+/// idle there would be noise. For user turns, the CLI's result is the cancel
+/// ack for the quarantine interrupt, so its error is suppressed (mirrors the
+/// user-stop path) unless the state is a genuine "failed"; a stale user-stop
+/// flag must be dropped, or the next turn's failed result would be misread as
+/// an interrupt ack and silently swallowed.
+fn quarantine_lift_recovery(
+    from_internal: bool,
+    state: &str,
+    error: Option<&str>,
+    pending_interrupt: bool,
+) -> (bool, bool, Option<String>) {
+    if from_internal {
+        return (false, false, None);
+    }
+    let emit_error = if state == "failed" {
+        error.map(String::from)
+    } else {
+        None
+    };
+    (true, pending_interrupt, emit_error)
+}
+
+/// Decide what to persist to meta at user-turn idle, from the in-mem result
+/// subtype. Error subtypes persist subtype+message so finalize_meta at EOF can
+/// mark the run Failed; a clean result clears stale fields from an earlier
+/// turn instead — otherwise finalize_meta would wrongly mark a 0-exit run
+/// Failed. Mirrors the (previously dead) clear-on-running intent, moved to
+/// the point where the information is actually available.
+fn idle_error_persist(
+    result_subtype: Option<&str>,
+    error: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    if result_subtype.is_some_and(|s| s.starts_with("error")) {
+        (error.map(String::from), result_subtype.map(String::from))
+    } else {
+        (None, None)
+    }
+}
+
 fn build_control_response(request_id: &str, outcome: Result<Value, String>) -> Value {
     let inner = match outcome {
         Ok(response) => serde_json::json!({
@@ -135,6 +226,8 @@ pub struct RalphCancelResult {
 /// Used for diagnosing hard-timeout causes.
 #[derive(Debug)]
 struct PendingInteractiveRequest {
+    request_id: String,
+    kind: PendingKind,
     /// "can_use_tool" | "hook_callback" | "elicitation"
     subtype: String,
     /// tool_name / hook event / server name
@@ -290,6 +383,10 @@ struct SessionActor {
     /// JSON parse failures in handle_stdout_line (before map_event).
     /// Complements ParserStats.parse_warn_count (field-level malformation).
     json_parse_fail_count: u32,
+    /// User turn hard-timeout override. None = timeout disabled (no quarantine
+    /// on silence); Some(d) = silence-quarantine after d. Default (30 min) is
+    /// resolved at spawn from the timeout_minutes setting.
+    user_hard_timeout: Option<Duration>,
 
     // ── Ralph Loop fields ──
     /// Ralph loop state (None = inactive / completed).
@@ -298,12 +395,11 @@ struct SessionActor {
     ralph_needs_dispatch: bool,
 
     // ── Observability: pending interactive request tracking ──
-    /// Tracks the most recent interactive control request awaiting user response.
     /// Pending interactive requests keyed by request_id (one per PermissionPrompt /
     /// HookCallback(PreToolUse) / ElicitationPrompt). A single turn can have MANY
     /// concurrent prompts (parallel tool use), so this must be a map, not a single
     /// slot — otherwise a later prompt clobbers the earlier ones' timeout diagnostics.
-    /// Each entry is removed when its response/cancel arrives. (#128-adjacent)
+    /// Cleared when the response is received; retained during quarantine for diagnostics.
     pending_interactive_requests: HashMap<String, PendingInteractiveRequest>,
 
     /// Tool names the user chose to "remember" via an allow response. While a tool
@@ -339,17 +435,20 @@ pub fn spawn_actor(
     // Codex app-server transport: the driver + its handshake messages. `None`/empty = Claude.
     codex: Option<CodexAppServer>,
     codex_startup: Vec<Value>,
+    // User turn hard timeout (None = disabled, resolved from timeout_minutes at spawn).
+    user_hard_timeout: Option<Duration>,
 ) -> SessionActorHandle {
     let tag = Arc::new(());
     let (cmd_tx, cmd_rx) = mpsc::channel::<ActorCommand>(64);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     log::debug!(
-        "[actor] spawn: run_id={}, is_resume={}, initial_turn_index={}, initial_auto_ctx_id={}",
+        "[actor] spawn: run_id={}, is_resume={}, initial_turn_index={}, initial_auto_ctx_id={}, user_hard_timeout={:?}",
         run_id,
         is_resume,
         initial_turn_index,
-        initial_auto_ctx_id
+        initial_auto_ctx_id,
+        user_hard_timeout
     );
 
     let actor = SessionActor {
@@ -385,6 +484,7 @@ pub fn spawn_actor(
         quarantine_from_internal: false,
         terminated: false,
         json_parse_fail_count: 0,
+        user_hard_timeout,
         ralph_loop: None,
         ralph_needs_dispatch: false,
         pending_interactive_requests: HashMap::new(),
@@ -467,26 +567,54 @@ impl SessionActor {
                             let _ = reply.send(r);
                         }
                         Some(ActorCommand::CancelControlRequest { request_id, reply }) => {
-                            self.clear_pending_interactive_request(&request_id);
                             let r = self.handle_cancel_control_request(&request_id).await;
                             let _ = reply.send(r);
                         }
                         Some(ActorCommand::RespondHookCallback { request_id, response, reply }) => {
                             log::debug!("[actor] RespondHookCallback: run_id={}, req_id={}", self.run_id, request_id);
-                            self.clear_pending_interactive_request(&request_id);
-                            let result = self.write_control_response(&request_id, response).await;
+                            let resolution = response
+                                .get("decision")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned);
+                            let result = self
+                                .deliver_interaction_response(
+                                    PendingKind::Hook,
+                                    &request_id,
+                                    "hook",
+                                    resolution.as_deref(),
+                                    response,
+                                )
+                                .await;
                             let _ = reply.send(result);
                         }
                         Some(ActorCommand::RespondElicitation { request_id, response, reply }) => {
                             log::debug!("[actor] RespondElicitation: run_id={}, req_id={}", self.run_id, request_id);
-                            self.clear_pending_interactive_request(&request_id);
-                            let result = self.write_interactive_response(PendingKind::Elicitation, &request_id, response).await;
+                            let resolution = response
+                                .get("action")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned);
+                            let result = self
+                                .deliver_interaction_response(
+                                    PendingKind::Elicitation,
+                                    &request_id,
+                                    "elicitation",
+                                    resolution.as_deref(),
+                                    response,
+                                )
+                                .await;
                             let _ = reply.send(result);
                         }
                         Some(ActorCommand::RespondUserInput { request_id, response, reply }) => {
                             log::debug!("[actor] RespondUserInput: run_id={}, req_id={}", self.run_id, request_id);
-                            self.clear_pending_interactive_request(&request_id);
-                            let result = self.write_interactive_response(PendingKind::UserInput, &request_id, response).await;
+                            let result = self
+                                .deliver_interaction_response(
+                                    PendingKind::UserInput,
+                                    &request_id,
+                                    "user_input",
+                                    None,
+                                    response,
+                                )
+                                .await;
                             let _ = reply.send(result);
                         }
                         Some(ActorCommand::StartRalphLoop { prompt, max_iterations, completion_promise, reply }) => {
@@ -788,6 +916,13 @@ impl SessionActor {
             client_uuid: None,
             attachments: vec![],
         });
+        // New turn: drop error tracking from the last error result. The
+        // parser sets result_subtype/got_result_event only on error results and
+        // never clears them on success; a stale in-mem subtype would make this
+        // turn's idle re-persist the old error to meta and finalize_meta would
+        // wrongly mark a 0-exit run Failed at EOF.
+        self.protocol.got_result_event = false;
+        self.protocol.result_subtype = None;
         self.emit_state("running", None, None, false);
         self.persist_idle_running(RunStatus::Running);
 
@@ -802,7 +937,9 @@ impl SessionActor {
             phase: TurnPhase::Active,
             started_at: now,
             soft_deadline: now + USER_SOFT_TIMEOUT,
-            hard_deadline: now + USER_HARD_TIMEOUT,
+            // None (timeout disabled) falls back to the default deadline — the
+            // tick gate (user_hard_timeout.is_some()) keeps it from ever firing.
+            hard_deadline: now + self.user_hard_timeout.map_or(USER_HARD_TIMEOUT, |d| d),
             turn_index: ticket.turn_index,
         });
     }
@@ -952,6 +1089,11 @@ impl SessionActor {
             client_uuid: None,
             attachments: vec![],
         });
+        // New turn: drop error tracking from the last error result — same
+        // rationale as start_user_turn; a stale subtype would re-persist the old
+        // error at this turn's idle and mark a 0-exit run Failed at EOF.
+        self.protocol.got_result_event = false;
+        self.protocol.result_subtype = None;
         self.emit_state("running", None, None, false);
         self.persist_idle_running(RunStatus::Running);
 
@@ -962,7 +1104,9 @@ impl SessionActor {
             phase: TurnPhase::Active,
             started_at: now,
             soft_deadline: now + USER_SOFT_TIMEOUT,
-            hard_deadline: now + USER_HARD_TIMEOUT,
+            // None (timeout disabled) falls back to the default deadline — the
+            // tick gate (user_hard_timeout.is_some()) keeps it from ever firing.
+            hard_deadline: now + self.user_hard_timeout.map_or(USER_HARD_TIMEOUT, |d| d),
             turn_index,
         });
 
@@ -1115,6 +1259,23 @@ impl SessionActor {
 
     /// Independent timeout clock — checks soft/hard deadlines and quarantine. (HC #4)
     async fn on_tick_timeout(&mut self) {
+        let expired_codex_requests = self
+            .codex
+            .as_mut()
+            .map(CodexAppServer::expire_deferred)
+            .unwrap_or_default();
+        for frame in &expired_codex_requests {
+            if let Err(error) = self
+                .write_json_line(frame, "expired codex interactive request")
+                .await
+            {
+                log::error!(
+                    "[codex] expired request response failed: run_id={}, error={}",
+                    self.run_id,
+                    error
+                );
+            }
+        }
         // Check quarantine deadline first
         if self.quarantine_until_result {
             if let Some(deadline) = self.quarantine_deadline {
@@ -1224,8 +1385,8 @@ impl SessionActor {
             }
         }
         // User turns: typically don't time out (CLI manages its own flow)
-        // but hard_deadline provides a safety net
-        else if now >= turn.hard_deadline {
+        // but hard_deadline provides a safety net. Disabled (None) never fires.
+        else if self.user_hard_timeout.is_some() && now >= turn.hard_deadline {
             if self.pending_interactive_requests.is_empty() {
                 log::warn!(
                     "[turn] user hard timeout: entering quarantine for run_id={} (turn_seq={})",
@@ -1242,8 +1403,8 @@ impl SessionActor {
                 // The turn is WAITING ON THE USER (AskUserQuestion / can_use_tool /
                 // elicitation), not a hung CLI. Quarantining here would cancel the
                 // prompt — and the user's eventual answer would target a dead
-                // request_id (stuck answer + re-ask, the [ede_diagnostic] case).
-                // Defer the deadline instead so a slow human answer is never killed.
+                // request_id (stuck answer + re-ask). Defer the deadline instead so a
+                // slow human answer is never killed.
                 let pending = self.pending_interactive_requests.len();
                 if let Some(t) = self.active_turn.as_mut() {
                     t.hard_deadline = now + USER_HARD_TIMEOUT;
@@ -1749,9 +1910,122 @@ impl SessionActor {
                 }
             }
         }
+        let resolution = response
+            .get("behavior")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        self.deliver_interaction_response(
+            PendingKind::Permission,
+            request_id,
+            "permission",
+            resolution.as_deref(),
+            response,
+        )
+        .await
+    }
+
+    async fn deliver_interaction_response(
+        &mut self,
+        kind: PendingKind,
+        request_id: &str,
+        interaction_kind: &str,
+        resolution: Option<&str>,
+        response: Value,
+    ) -> Result<(), String> {
+        if let Some(codex) = self.codex.as_ref() {
+            codex
+                .validate_response(kind, request_id)
+                .map_err(|error| format!("[interaction:not_started] {error}"))?;
+        } else {
+            let pending = self
+                .pending_interactive_requests
+                .get(request_id)
+                .ok_or_else(|| {
+                    "[interaction:not_started] no pending interactive request".to_string()
+                })?;
+            if pending.kind != kind {
+                return Err(format!(
+                    "[interaction:not_started] unknown or mismatched interactive request_id {request_id}"
+                ));
+            }
+        }
+        self.persist_interaction_started(request_id, interaction_kind, resolution)
+            .map_err(|error| format!("[interaction:not_started] {error}"))?;
         self.clear_pending_interactive_request(request_id);
-        self.write_interactive_response(PendingKind::Permission, request_id, response)
-            .await
+        let wire_result = self
+            .write_interactive_response(kind, request_id, response)
+            .await;
+        if let Err(error) = wire_result {
+            let durable_error =
+                self.persist_interaction_failed(request_id, interaction_kind, &error);
+            return Err(match durable_error {
+                Ok(()) => format!("[interaction:delivery_failed] {error}"),
+                Err(persist_error) => {
+                    format!(
+                        "[interaction:delivery_failed] {error}; failed to persist response failure: {persist_error}"
+                    )
+                }
+            });
+        }
+        self.persist_interaction_resolved(request_id, interaction_kind, resolution)
+            .map_err(|error| format!("[interaction:delivery_unknown] {error}"))
+    }
+
+    fn persist_interaction_started(
+        &self,
+        request_id: &str,
+        interaction_kind: &str,
+        resolution: Option<&str>,
+    ) -> Result<(), String> {
+        self.emitter
+            .persist_and_emit_durable(
+                &self.run_id,
+                &BusEvent::InteractionResponseStarted {
+                    run_id: self.run_id.clone(),
+                    request_id: request_id.to_string(),
+                    interaction_kind: interaction_kind.to_string(),
+                    resolution: resolution.map(str::to_owned),
+                },
+            )
+            .map(|_| ())
+    }
+
+    fn persist_interaction_failed(
+        &self,
+        request_id: &str,
+        interaction_kind: &str,
+        error: &str,
+    ) -> Result<(), String> {
+        self.emitter
+            .persist_and_emit_durable(
+                &self.run_id,
+                &BusEvent::InteractionResponseFailed {
+                    run_id: self.run_id.clone(),
+                    request_id: request_id.to_string(),
+                    interaction_kind: interaction_kind.to_string(),
+                    error: truncate_str(error, 512).to_string(),
+                },
+            )
+            .map(|_| ())
+    }
+
+    fn persist_interaction_resolved(
+        &self,
+        request_id: &str,
+        interaction_kind: &str,
+        resolution: Option<&str>,
+    ) -> Result<(), String> {
+        self.emitter
+            .persist_and_emit_durable(
+                &self.run_id,
+                &BusEvent::InteractionResolved {
+                    run_id: self.run_id.clone(),
+                    request_id: request_id.to_string(),
+                    interaction_kind: Some(interaction_kind.to_string()),
+                    resolution: resolution.map(str::to_owned),
+                },
+            )
+            .map(|_| ())
     }
 
     /// Write a response to a pending interactive request. Codex frames it as a JSON-RPC
@@ -1765,7 +2039,7 @@ impl SessionActor {
         let Some(codex) = self.codex.as_mut() else {
             return self.write_control_response(request_id, response).await;
         };
-        let lines = codex.frame_response(kind, request_id, response);
+        let lines = codex.frame_response(kind, request_id, response)?;
         for line in &lines {
             self.write_json_line(line, "codex interactive response")
                 .await?;
@@ -1775,14 +2049,24 @@ impl SessionActor {
 
     /// Remove the pending interactive request with the given request_id (if present).
     fn clear_pending_interactive_request(&mut self, request_id: &str) {
-        if let Some(req) = self.pending_interactive_requests.remove(request_id) {
+        Self::clear_pending_interactive_request_map(
+            &mut self.pending_interactive_requests,
+            request_id,
+        );
+    }
+
+    fn clear_pending_interactive_request_map(
+        pending: &mut HashMap<String, PendingInteractiveRequest>,
+        request_id: &str,
+    ) {
+        if let Some(req) = pending.remove(request_id) {
             log::debug!(
-                "[actor] cleared pending_interactive_request: req_id={}, subtype={}, detail={}, waited={}s, remaining={}",
-                request_id,
+                "[actor] clearing pending_interactive_request: request_id={}, subtype={}, detail={}, waited={}s, remaining={}",
+                req.request_id,
                 req.subtype,
                 req.detail,
                 req.received_at.elapsed().as_secs(),
-                self.pending_interactive_requests.len()
+                pending.len()
             );
         }
     }
@@ -1799,6 +2083,17 @@ impl SessionActor {
     /// e.g. the user dismisses a permission prompt). NOT for auto-declining unsupported
     /// requests — those use write_control_response_error (the CLI waits for a response).
     async fn handle_cancel_control_request(&mut self, request_id: &str) -> Result<(), String> {
+        ensure_control_cancel_supported(self.codex.is_some())?;
+        let kind = self
+            .pending_interactive_requests
+            .get(request_id)
+            .map(|pending| pending.kind)
+            .ok_or_else(|| {
+                format!("[interaction:not_started] unknown interactive request_id {request_id}")
+            })?;
+        let interaction_kind = pending_kind_name(kind);
+        self.persist_interaction_started(request_id, interaction_kind, Some("cancel"))
+            .map_err(|error| format!("[interaction:not_started] {error}"))?;
         let payload = serde_json::json!({
             "type": "control_cancel_request",
             "request_id": request_id,
@@ -1808,8 +2103,31 @@ impl SessionActor {
             self.run_id,
             request_id,
         );
-        self.write_json_line(&payload, "cancel control request")
+        if let Err(error) = self
+            .write_json_line(&payload, "cancel control request")
             .await
+        {
+            self.clear_pending_interactive_request(request_id);
+            let durable_error =
+                self.persist_interaction_failed(request_id, interaction_kind, &error);
+            return Err(match durable_error {
+                Ok(()) => format!("[interaction:delivery_failed] {error}"),
+                Err(persist_error) => format!(
+                    "[interaction:delivery_failed] {error}; failed to persist response failure: {persist_error}"
+                ),
+            });
+        }
+        self.clear_pending_interactive_request(request_id);
+        self.emitter
+            .persist_and_emit_durable(
+                &self.run_id,
+                &BusEvent::ControlCancelled {
+                    run_id: self.run_id.clone(),
+                    request_id: request_id.to_string(),
+                },
+            )
+            .map(|_| ())
+            .map_err(|error| format!("[interaction:delivery_unknown] {error}"))
     }
 
     /// Low-level helper: serialize JSON payload, write to stdin, flush.
@@ -1818,20 +2136,7 @@ impl SessionActor {
             .stdin
             .as_mut()
             .ok_or_else(|| "stdin closed".to_string())?;
-        let mut line = serde_json::to_string(payload).map_err(|e| e.to_string())?;
-        line.push('\n');
-        stdin
-            .write_all(line.as_bytes())
-            .await
-            .map_err(|e| format!("{} write failed: {}", context, e))?;
-        if let Err(e) = stdin.flush().await {
-            log::warn!(
-                "[actor] stdin flush failed for run_id={}: {}",
-                self.run_id,
-                e
-            );
-        }
-        Ok(())
+        write_json_line_to(stdin, payload, context).await
     }
 
     /// Shared helper: write a success control_response JSON to CLI stdin.
@@ -1875,9 +2180,25 @@ impl SessionActor {
     /// and routes its events / lifecycle / interactive / thread-id signals into the *shared*
     /// turn engine (`end_turn_and_dispatch`, `emit_state`) — no Claude control protocol.
     async fn handle_codex_line(&mut self, text: &str) {
-        apply_activity_reset(self.quarantine_until_result, &mut self.active_turn);
+        apply_activity_reset(
+            self.quarantine_until_result,
+            self.user_hard_timeout,
+            &mut self.active_turn,
+        );
 
         let parsed = self.codex.as_mut().unwrap().parse_line(&self.run_id, text);
+
+        // Parser-generated requests (currently spawned-thread identity reads) must be written
+        // before processing later notifications that can depend on their metadata.
+        for frame in &parsed.outbound {
+            if let Err(error) = self.write_json_line(frame, "codex protocol request").await {
+                log::error!(
+                    "[codex] protocol request failed: run_id={}, error={}",
+                    self.run_id,
+                    error
+                );
+            }
+        }
 
         // Route a data-returning request reply (thread/fork, thread/rollback, thread/goal/get)
         // back to the waiting control caller — mirrors the Claude control_response path.
@@ -1931,15 +2252,18 @@ impl SessionActor {
         }
 
         // Track a pending interactive request (observability + desktop notification).
-        if let Some(pi) = parsed.interactive {
+        for pi in parsed.interactive {
             let subtype = match pi.kind {
                 PendingKind::Permission => "can_use_tool",
+                PendingKind::Hook => "hook_callback",
                 PendingKind::Elicitation => "elicitation",
                 PendingKind::UserInput => "request_user_input",
             };
             self.pending_interactive_requests.insert(
-                pi.request_id,
+                pi.request_id.clone(),
                 PendingInteractiveRequest {
+                    request_id: pi.request_id,
+                    kind: pi.kind,
                     subtype: subtype.to_string(),
                     detail: String::new(),
                     received_at: Instant::now(),
@@ -2013,7 +2337,11 @@ impl SessionActor {
         };
 
         // Activity-based deadline reset for user/ralph turns.
-        if apply_activity_reset(self.quarantine_until_result, &mut self.active_turn) {
+        if apply_activity_reset(
+            self.quarantine_until_result,
+            self.user_hard_timeout,
+            &mut self.active_turn,
+        ) {
             log::trace!(
                 "[turn] activity reset: hard_deadline extended for run_id={}",
                 self.run_id
@@ -2047,7 +2375,13 @@ impl SessionActor {
                     self.protocol.stats.invalid_tool_count += 1;
                     continue;
                 }
-                if let BusEvent::RunState { state, .. } = event {
+                if let BusEvent::RunState {
+                    state,
+                    exit_code,
+                    error,
+                    ..
+                } = event
+                {
                     // HC #17: Only lift on turn-boundary states
                     if state == "idle" || state == "failed" {
                         log::debug!(
@@ -2055,16 +2389,58 @@ impl SessionActor {
                             state,
                             self.run_id
                         );
+                        let from_internal = self.quarantine_from_internal;
                         self.quarantine_until_result = false;
                         self.quarantine_deadline = None;
                         self.interrupt_sent_for_quarantine = false;
                         self.quarantine_from_internal = false;
                         self.protocol.set_pending_slash_command(None);
-                        // Don't emit quarantine RunState to frontend (it was an internal turn)
+                        let (emit, clear_interrupt, emit_error) = quarantine_lift_recovery(
+                            from_internal,
+                            state,
+                            error.as_deref(),
+                            self.pending_interrupt,
+                        );
+                        if clear_interrupt {
+                            self.pending_interrupt = false;
+                        }
+                        if emit {
+                            // Mirror the normal user-turn RunState path (emit_state +
+                            // idle meta) so the frontend phase recovers from the
+                            // interrupted turn. The result lifting quarantine is the
+                            // cancel ack for the quarantine interrupt — clear the
+                            // in-mem error tracking like the user-stop path does,
+                            // or a stale error subtype would be re-persisted to meta
+                            // at the next turn's idle and finalize_meta would mark
+                            // the run Failed at EOF.
+                            self.protocol.got_result_event = false;
+                            self.protocol.result_subtype = None;
+                            self.emit_state(state, *exit_code, emit_error, false);
+                            if state == "idle" {
+                                self.persist_idle_running(RunStatus::Idle);
+                                // Clean-idle lift: the interrupted turn is a cancel
+                                // ack, not an error — clear stale meta error fields,
+                                // since this path bypasses the idle handler that
+                                // does it for normal turns.
+                                if let Err(e) =
+                                    storage::runs::clear_result_error_if_present(&self.run_id)
+                                {
+                                    log::warn!("[actor] failed to clear stale meta error: {}", e);
+                                }
+                            }
+                        }
                         // Just try to dispatch next queued item
                         self.try_dispatch().await;
                         return;
                     }
+                }
+                // Tool termination must reach the frontend even during quarantine —
+                // the interrupted tool would otherwise stay "running" forever in the
+                // chat tree (the quarantine swallow is meant for mid-turn noise,
+                // not terminal tool states).
+                if quarantine_event_passthrough(event) {
+                    self.persist_and_emit(event);
+                    continue;
                 }
             }
             // Everything else during quarantine → swallow
@@ -2178,27 +2554,29 @@ impl SessionActor {
 
                     if emit_state == "idle" {
                         self.persist_idle_running(RunStatus::Idle);
-                        // If the result event indicated an error, persist subtype+message
-                        // to meta so finalize_meta on EOF can mark the run Failed.
-                        let had_result_error = self
-                            .protocol
-                            .result_subtype
-                            .as_deref()
-                            .map(|s| s.starts_with("error"))
-                            .unwrap_or(false);
-                        if had_result_error {
-                            log::debug!(
-                                "[actor] persisting idle-with-error: subtype={:?}, error={:?}",
-                                self.protocol.result_subtype,
-                                emit_error
-                            );
-                            if let Err(e) = storage::runs::persist_result_error(
+                        // Persist error details from this turn's result to meta (so
+                        // finalize_meta on EOF can mark the run Failed) — or, on a
+                        // clean result, clear stale error fields from an earlier
+                        // turn. The turn-start reset above guarantees the in-mem
+                        // subtype is this turn's, never a stale one.
+                        let (idle_error, idle_subtype) = idle_error_persist(
+                            self.protocol.result_subtype.as_deref(),
+                            emit_error.as_deref(),
+                        );
+                        let idle_persist = if idle_subtype.is_some() {
+                            storage::runs::persist_result_error(
                                 &self.run_id,
-                                emit_error.clone(),
-                                self.protocol.result_subtype.clone(),
-                            ) {
-                                log::warn!("[actor] failed to persist result error: {}", e);
-                            }
+                                idle_error,
+                                idle_subtype,
+                            )
+                        } else {
+                            // Clean result — drop stale fields from an earlier turn
+                            // without rewriting meta when there are none (the
+                            // unconditional persist would rewrite per turn).
+                            storage::runs::clear_result_error_if_present(&self.run_id)
+                        };
+                        if let Err(e) = idle_persist {
+                            log::warn!("[actor] failed to persist idle error state: {}", e);
                         }
                     }
 
@@ -2390,6 +2768,8 @@ impl SessionActor {
                 self.pending_interactive_requests.insert(
                     request_id.clone(),
                     PendingInteractiveRequest {
+                        request_id: request_id.clone(),
+                        kind: PendingKind::Hook,
                         subtype: "hook_callback".to_string(),
                         detail: format!("PreToolUse:{}", hook_label),
                         received_at: Instant::now(),
@@ -2470,6 +2850,8 @@ impl SessionActor {
             self.pending_interactive_requests.insert(
                 request_id.clone(),
                 PendingInteractiveRequest {
+                    request_id: request_id.clone(),
+                    kind: PendingKind::Elicitation,
                     subtype: "elicitation".to_string(),
                     detail: mcp_server_name.clone(),
                     received_at: Instant::now(),
@@ -2481,7 +2863,7 @@ impl SessionActor {
                 &format!(
                     "{}: {} needs input",
                     truncate_str(&self.run_id, 8),
-                    &mcp_server_name
+                    mcp_server_name
                 ),
             );
         } else if subtype == "can_use_tool" {
@@ -2562,8 +2944,10 @@ impl SessionActor {
                 suggestions,
             });
             self.pending_interactive_requests.insert(
-                request_id,
+                request_id.clone(),
                 PendingInteractiveRequest {
+                    request_id,
+                    kind: PendingKind::Permission,
                     subtype: "can_use_tool".to_string(),
                     detail: tool_label.clone(),
                     received_at: Instant::now(),
@@ -2575,7 +2959,7 @@ impl SessionActor {
                 &format!(
                     "{} wants to use: {}",
                     truncate_str(&self.run_id, 8),
-                    &tool_label
+                    tool_label
                 ),
             );
         } else {
@@ -2847,34 +3231,11 @@ impl SessionActor {
                 }
             }
 
-            // Clear error fields on new turn
-            if new_state == "running" {
-                if let Err(e) = runs::with_meta(&self.run_id, |meta| {
-                    if meta.error_message.is_some() || meta.result_subtype.is_some() {
-                        meta.error_message = None;
-                        meta.result_subtype = None;
-                        log::debug!(
-                            "[actor] cleared error_message/result_subtype for new turn: run={}",
-                            self.run_id
-                        );
-                    }
-                    Ok(())
-                }) {
-                    log::warn!(
-                        "[actor] clear error fields failed: run={} err={}",
-                        self.run_id,
-                        e
-                    );
-                }
-                // Also reset the in-mem error tracking. The parser sets result_subtype
-                // only on error results and never clears it on success (see claude_protocol
-                // test "success doesn't set got_result_event"). Without this, a stale error
-                // subtype from an earlier turn survives into a later successful turn and
-                // gets re-persisted at that turn's idle (had_result_error), making
-                // finalize_meta on EOF wrongly mark a 0-exit run as Failed. Mirrors the
-                // meta clear above and the interrupt path's reset.
-                self.protocol.result_subtype = None;
-            }
+            // Note: no error-field clearing on "running" here — every
+            // emit_state("running") caller passes update_meta=false, so a clear
+            // under this gate would be dead code (it was: SF2). The real reset
+            // lives at turn start (in-mem) and at clean idle (meta) in
+            // handle_stdout_line / start_user_turn.
 
             // Persist result error details on failed
             if new_state == "failed" {
@@ -3200,9 +3561,64 @@ pub fn build_user_payload(
 
 #[cfg(test)]
 mod tests {
-    use super::build_control_response;
-    use crate::models::{max_attachment_size, ALLOWED_DOC_TYPES, ALLOWED_IMAGE_TYPES};
+    use super::{
+        build_control_response, ensure_control_cancel_supported, pending_kind_name,
+        write_json_line_to, PendingInteractiveRequest, SessionActor,
+    };
+    use crate::agent::session_protocol::PendingKind;
+    use crate::models::{max_attachment_size, BusEvent, ALLOWED_DOC_TYPES, ALLOWED_IMAGE_TYPES};
     use serde_json::json;
+    use std::collections::HashMap;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use std::time::{Duration, Instant};
+    use tokio::io::AsyncWrite;
+
+    struct FlushFailWriter(Vec<u8>);
+
+    impl AsyncWrite for FlushFailWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.0.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "flush rejected",
+            )))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn json_line_flush_failure_is_not_reported_as_success() {
+        let mut writer = FlushFailWriter(Vec::new());
+        let error = write_json_line_to(&mut writer, &json!({"type":"response"}), "response")
+            .await
+            .unwrap_err();
+        assert!(error.contains("response flush failed"));
+        assert!(writer.0.ends_with(b"\n"));
+    }
+
+    #[test]
+    fn control_cancel_rejects_codex_before_wire_delivery() {
+        let error = ensure_control_cancel_supported(true).unwrap_err();
+        assert!(error.contains("[interaction:not_started]"));
+        assert!(error.contains("unsupported for Codex"));
+        assert!(ensure_control_cancel_supported(false).is_ok());
+        assert_eq!(pending_kind_name(PendingKind::Permission), "permission");
+        assert_eq!(pending_kind_name(PendingKind::Hook), "hook");
+        assert_eq!(pending_kind_name(PendingKind::Elicitation), "elicitation");
+        assert_eq!(pending_kind_name(PendingKind::UserInput), "user_input");
+    }
 
     /// Helper: build a multimodal content array the same way handle_send_message does,
     /// including size validation (base64 len * 3/4 vs max_attachment_size).
@@ -3279,6 +3695,77 @@ mod tests {
     }
 
     #[test]
+    fn pending_interactive_requests_clear_independently() {
+        let now = Instant::now();
+        let mut pending = HashMap::from([
+            (
+                "first".to_string(),
+                PendingInteractiveRequest {
+                    request_id: "first".to_string(),
+                    kind: PendingKind::Permission,
+                    subtype: "can_use_tool".to_string(),
+                    detail: "Bash".to_string(),
+                    received_at: now - Duration::from_secs(2),
+                },
+            ),
+            (
+                "second".to_string(),
+                PendingInteractiveRequest {
+                    request_id: "second".to_string(),
+                    kind: PendingKind::UserInput,
+                    subtype: "request_user_input".to_string(),
+                    detail: String::new(),
+                    received_at: now,
+                },
+            ),
+        ]);
+
+        SessionActor::clear_pending_interactive_request_map(&mut pending, "second");
+
+        assert!(pending.contains_key("first"));
+        assert!(!pending.contains_key("second"));
+    }
+
+    #[test]
+    fn interaction_response_events_use_contract_tags() {
+        let events = [
+            (
+                BusEvent::InteractionResponseStarted {
+                    run_id: "run-1".to_string(),
+                    request_id: "request-1".to_string(),
+                    interaction_kind: "permission".to_string(),
+                    resolution: Some("allow".to_string()),
+                },
+                "interaction_response_started",
+            ),
+            (
+                BusEvent::InteractionResponseFailed {
+                    run_id: "run-1".to_string(),
+                    request_id: "request-1".to_string(),
+                    interaction_kind: "permission".to_string(),
+                    error: "closed".to_string(),
+                },
+                "interaction_response_failed",
+            ),
+            (
+                BusEvent::InteractionResolved {
+                    run_id: "run-1".to_string(),
+                    request_id: "request-1".to_string(),
+                    interaction_kind: Some("permission".to_string()),
+                    resolution: Some("allow".to_string()),
+                },
+                "interaction_resolved",
+            ),
+        ];
+        for (event, expected) in events {
+            let value = serde_json::to_value(&event).unwrap();
+            assert_eq!(value["type"], expected);
+            assert!(crate::storage::events::is_replayable(&event));
+            assert!(crate::agent::claude_protocol::validate_bus_event(&event).is_none());
+        }
+    }
+
+    #[test]
     fn mixed_attachments() {
         let parts = build_content_parts(
             "hello",
@@ -3326,5 +3813,126 @@ mod tests {
         assert_eq!(strip_ansi(input), "2026-06-03 ERROR codex_core: failed");
         // Plain text is unchanged.
         assert_eq!(strip_ansi("no codes here"), "no codes here");
+    }
+
+    #[test]
+    fn quarantine_passes_tool_end_through() {
+        use super::quarantine_event_passthrough;
+        // user_rejected_tool_use (and any terminal tool state) must reach the
+        // frontend during quarantine — regression guard for the timeout fix.
+        let ev = BusEvent::ToolEnd {
+            run_id: "r".to_string(),
+            tool_use_id: "tu-1".to_string(),
+            tool_name: "Bash".to_string(),
+            output: serde_json::Value::Null,
+            status: "rejected".to_string(),
+            duration_ms: None,
+            parent_tool_use_id: None,
+            tool_use_result: None,
+        };
+        assert!(quarantine_event_passthrough(&ev));
+    }
+
+    #[test]
+    fn quarantine_swallows_mid_turn_events() {
+        use super::quarantine_event_passthrough;
+        let cases = vec![
+            BusEvent::ToolStart {
+                run_id: "r".to_string(),
+                tool_use_id: "tu-1".to_string(),
+                tool_name: "Bash".to_string(),
+                input: serde_json::Value::Null,
+                parent_tool_use_id: None,
+            },
+            BusEvent::MessageDelta {
+                run_id: "r".to_string(),
+                text: "hi".to_string(),
+                parent_tool_use_id: None,
+            },
+            BusEvent::Raw {
+                run_id: "r".to_string(),
+                source: "claude_x".to_string(),
+                data: serde_json::Value::Null,
+            },
+        ];
+        for ev in &cases {
+            assert!(
+                !quarantine_event_passthrough(ev),
+                "mid-turn event must not pass quarantine: {:?}",
+                ev
+            );
+        }
+    }
+
+    #[test]
+    fn quarantine_lift_emits_idle_for_user_turn() {
+        use super::quarantine_lift_recovery;
+        // User turn (quarantine_from_internal=false) → emit idle, suppress the
+        // cancel-ack error, drop the stale user-stop flag.
+        let (emit, clear, error) =
+            quarantine_lift_recovery(false, "idle", Some("cancel ack"), true);
+        assert!(emit);
+        assert!(clear);
+        assert_eq!(error, None);
+    }
+
+    #[test]
+    fn quarantine_lift_common_case() {
+        use super::quarantine_lift_recovery;
+        // Typical quarantine: user turn, no pending user-stop flag, cancel-ack
+        // idle — emit plain idle, nothing to clean up.
+        let (emit, clear, error) = quarantine_lift_recovery(false, "idle", Some("ack"), false);
+        assert!(emit);
+        assert!(!clear);
+        assert_eq!(error, None);
+    }
+
+    #[test]
+    fn quarantine_lift_suppresses_internal_turns() {
+        use super::quarantine_lift_recovery;
+        let (emit, clear, error) = quarantine_lift_recovery(true, "idle", Some("err"), true);
+        assert!(!emit);
+        assert!(!clear);
+        assert_eq!(error, None);
+    }
+
+    #[test]
+    fn quarantine_lift_keeps_error_on_failed() {
+        use super::quarantine_lift_recovery;
+        // A genuine "failed" keeps its message — only the idle cancel-ack is
+        // suppressed.
+        let (emit, clear, error) = quarantine_lift_recovery(false, "failed", Some("boom"), false);
+        assert!(emit);
+        assert!(!clear);
+        assert_eq!(error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn idle_error_persist_keeps_error_subtype() {
+        use super::idle_error_persist;
+        // Error result → subtype+message persist so finalize_meta marks the run Failed.
+        let (err, subtype) = idle_error_persist(Some("error_max_turns"), Some("max turns hit"));
+        assert_eq!(err.as_deref(), Some("max turns hit"));
+        assert_eq!(subtype.as_deref(), Some("error_max_turns"));
+    }
+
+    #[test]
+    fn idle_error_persist_clears_on_clean_result() {
+        use super::idle_error_persist;
+        // Clean result → clear tuple, so a stale meta error from an earlier turn
+        // is dropped instead of re-persisted.
+        let (err, subtype) = idle_error_persist(None, None);
+        assert_eq!(err, None);
+        assert_eq!(subtype, None);
+    }
+
+    #[test]
+    fn idle_error_persist_ignores_non_error_subtype() {
+        use super::idle_error_persist;
+        // Subtypes not starting with "error" (defensive; the parser only sets
+        // error ones today) behave like a clean result.
+        let (err, subtype) = idle_error_persist(Some("success"), Some("done"));
+        assert_eq!(err, None);
+        assert_eq!(subtype, None);
     }
 }

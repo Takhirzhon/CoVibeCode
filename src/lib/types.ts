@@ -184,6 +184,8 @@ export interface UserSettings {
   task_completion_sound?: string;
   /** Custom path/program to launch the Claude CLI (default: auto-detect). (#155) */
   claude_path?: string;
+  /** User turn hard-timeout in minutes. undefined = default (30 min), 0 = disabled. */
+  timeout_minutes?: number;
   updated_at: string;
 }
 
@@ -1099,6 +1101,35 @@ export type BusEvent =
       data: Record<string, unknown>;
     }
   | { type: "control_cancelled"; run_id: string; request_id: string }
+  | {
+      type: "codex_agent_info";
+      run_id: string;
+      thread_id: string;
+      nickname?: string;
+      role?: string;
+      parent_thread_id?: string;
+    }
+  | {
+      type: "interaction_response_started";
+      run_id: string;
+      request_id: string;
+      interaction_kind: "permission" | "hook" | "elicitation" | "user_input";
+      resolution?: "allow" | "deny" | "defer" | "accept" | "decline" | "cancel";
+    }
+  | {
+      type: "interaction_response_failed";
+      run_id: string;
+      request_id: string;
+      interaction_kind: "permission" | "hook" | "elicitation" | "user_input";
+      error: string;
+    }
+  | {
+      type: "interaction_resolved";
+      run_id: string;
+      request_id: string;
+      interaction_kind?: "permission" | "hook" | "elicitation" | "user_input";
+      resolution?: "allow" | "deny" | "defer" | "accept" | "decline" | "cancel";
+    }
   | { type: "command_output"; run_id: string; content: string }
   | {
       type: "elicitation_prompt";
@@ -1147,7 +1178,17 @@ export type BusEvent =
   | { type: "codex_mcp_status"; run_id: string; name: string; status: string; error?: string }
   // Codex Wave-4: turn-level aggregated unified diff (`turn/diff/updated`). diff is cumulative
   // across the turn; the store keeps the latest (cleared at the next turn). Not replayed.
-  | { type: "codex_turn_diff"; run_id: string; turn_id: string; diff: string };
+  | { type: "codex_turn_diff"; run_id: string; turn_id: string; diff: string }
+  // Resolved identity for a Codex sub-agent thread (via thread/read). Optional fields preserve
+  // compatibility with older Codex versions that omit part of the identity.
+  | {
+      type: "codex_agent_info";
+      run_id: string;
+      thread_id: string;
+      nickname?: string;
+      role?: string;
+      parent_thread_id?: string;
+    };
 
 export type RalphCompleteReason =
   | "max_iterations"
@@ -1195,6 +1236,12 @@ export interface ElicitationSchema {
   [key: string]: unknown;
 }
 
+export interface CodexAgentIdentity {
+  nickname?: string;
+  role?: string;
+  parentThreadId?: string;
+}
+
 export interface BusToolItem {
   tool_use_id: string;
   tool_name: string;
@@ -1207,9 +1254,14 @@ export interface BusToolItem {
     | "denied"
     | "ask_pending"
     | "permission_denied"
-    | "permission_prompt";
+    | "permission_prompt"
+    | "response_pending"
+    | "response_failed"
+    | "rejected";
   /** For permission_prompt status: the control_request ID needed to respond. */
   permission_request_id?: string;
+  /** Human-readable reason supplied by the CLI for the pending permission request. */
+  permission_reason?: string;
   duration_ms?: number;
   /** Real-time elapsed time from tool_progress (seconds, float). */
   elapsed_time_seconds?: number;
@@ -1233,6 +1285,7 @@ export type TimelineEntry =
       ts: string;
       attachments?: Attachment[];
       cliUuid?: string;
+      historyContent?: HistoryContent;
     }
   | {
       kind: "assistant";
@@ -1242,6 +1295,8 @@ export type TimelineEntry =
       ts: string;
       thinkingText?: string;
       model?: string;
+      historyContent?: HistoryContent;
+      thinkingHistoryContent?: HistoryContent;
     }
   | {
       kind: "tool";
@@ -1252,7 +1307,14 @@ export type TimelineEntry =
       subTimeline?: TimelineEntry[];
     }
   | { kind: "separator"; id: string; anchorId: string; content: string; ts: string }
-  | { kind: "command_output"; id: string; anchorId: string; content: string; ts: string }
+  | {
+      kind: "command_output";
+      id: string;
+      anchorId: string;
+      content: string;
+      ts: string;
+      historyContent?: HistoryContent;
+    }
   // Codex Wave-4: a hook execution timeline entry. Upserted by the `codex_hook_run`
   // reducer — keyed by `hookId` (= Codex run.id), stable across the started→completed
   // pair so the running card updates in place instead of stacking a second entry.
@@ -1267,6 +1329,106 @@ export type TimelineEntry =
       durationMs?: number;
       ts: string;
     };
+
+export interface HistoryContent {
+  preview: string;
+  byteLength: number;
+  truncated: boolean;
+  contentId?: string;
+  encoding: "text" | "json";
+}
+
+interface HistoryEntryBase {
+  id: string;
+  anchorId: string;
+  ts: string;
+  firstSeq: number;
+  lastSeq: number;
+}
+
+export type HistoryEntry =
+  | (HistoryEntryBase & {
+      kind: "user";
+      content: HistoryContent;
+      cliUuid?: string;
+      attachments?: Attachment[];
+    })
+  | (HistoryEntryBase & {
+      kind: "assistant";
+      content: HistoryContent;
+      thinking?: HistoryContent;
+      model?: string;
+    })
+  | (HistoryEntryBase & {
+      kind: "tool";
+      toolUseId: string;
+      toolName: string;
+      status: BusToolItem["status"];
+      input: Record<string, unknown>;
+      output: Record<string, unknown> | null;
+      toolUseResult?: Record<string, unknown>;
+      inputContent?: HistoryContent;
+      outputContent?: HistoryContent;
+      resultContent?: HistoryContent;
+      durationMs?: number;
+      subHistoryId?: string;
+    })
+  | (HistoryEntryBase & {
+      kind: "command_output" | "placeholder";
+      content: HistoryContent;
+    });
+
+export interface HistorySummary {
+  runId: string;
+  generationId: string;
+  pageCount: number;
+  totalEntries: number;
+  totalTurns: number;
+  lastSeq: number;
+  sourceSize: number;
+  sourceMtimeNs: number;
+  latestCursor?: string;
+  stateEvents: BusEvent[];
+}
+
+export interface BusEventPage {
+  events: BusEvent[];
+  lastSeq: number;
+  hasMore: boolean;
+  nextOffset: number;
+}
+
+export interface HistoryPage {
+  runId: string;
+  generationId: string;
+  entries: HistoryEntry[];
+  pageCursor: string;
+  previousCursor?: string;
+  hasMore: boolean;
+  firstSeq: number;
+  lastSeq: number;
+}
+
+export interface HistoryContentChunk {
+  runId: string;
+  generationId: string;
+  contentId: string;
+  offset: number;
+  nextOffset: number;
+  totalBytes: number;
+  eof: boolean;
+  dataBase64: string;
+}
+
+export interface SubHistoryPage {
+  runId: string;
+  generationId: string;
+  subHistoryId: string;
+  entries: HistoryEntry[];
+  pageCursor: string;
+  previousCursor?: string;
+  hasMore: boolean;
+}
 
 /** One row of a TodoWrite checklist (lives in a tool's `tool_use_result.newTodos`). */
 export interface TodoItem {

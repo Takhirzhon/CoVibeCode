@@ -21,7 +21,13 @@ use crate::agent::session_protocol::{
 };
 use crate::models::BusEvent;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{Duration, Instant};
+
+const MAX_UNCLAIMED_THREADS: usize = 32;
+const MAX_DEFERRED_MESSAGES_PER_THREAD: usize = 64;
+const MAX_DEFERRED_PAYLOAD_BYTES: usize = 512 * 1024;
+const DEFERRED_MESSAGE_TTL: Duration = Duration::from_secs(30);
 
 /// app-server method names for server→client interactive requests we handle.
 const M_CMD_APPROVAL: &str = "item/commandExecution/requestApproval";
@@ -44,6 +50,45 @@ struct PendingServerReq {
     /// Raw json-rpc id to echo in the response.
     raw_id: Value,
     method: String,
+    /// Requested grant profile for `item/permissions/requestApproval`. Codex requires the
+    /// response to echo only the subset the user granted; command/file approvals use decisions.
+    requested_permissions: Option<Value>,
+    kind: PendingKind,
+}
+
+enum DeferredThreadMessage {
+    Notification { method: String, params: Value },
+    Interactive { method: String, message: Value },
+}
+
+impl DeferredThreadMessage {
+    fn is_interactive(&self) -> bool {
+        matches!(self, Self::Interactive { .. })
+    }
+
+    fn payload_bytes(&self) -> usize {
+        match self {
+            Self::Notification { method, params } => method.len() + params.to_string().len(),
+            Self::Interactive { method, message } => method.len() + message.to_string().len(),
+        }
+    }
+}
+
+fn reject_deferred_interactive(message: DeferredThreadMessage, reason: &str, out: &mut ParsedLine) {
+    if let DeferredThreadMessage::Interactive { message, .. } = message {
+        out.outbound.push(json!({
+            "jsonrpc": "2.0",
+            "id": message.get("id").cloned().unwrap_or(Value::Null),
+            "error": { "code": -32600, "message": reason }
+        }));
+    }
+}
+
+struct DeferredThreadEntry {
+    message: DeferredThreadMessage,
+    received_at: Instant,
+    sequence: u64,
+    payload_bytes: usize,
 }
 
 pub struct CodexAppServer {
@@ -61,6 +106,20 @@ pub struct CodexAppServer {
     /// When the reply arrives (`parse_line` sees a matching id with no `method`) we resolve the
     /// actor's `control_waiter` for that frontend request_id with the JSON-RPC `result`/`error`.
     client_waiters: HashMap<i64, String>,
+    /// Autonomous `thread/read` requests keyed by JSON-RPC id → spawned thread id.
+    internal_waiters: HashMap<i64, String>,
+    /// Spawned threads already scheduled for identity lookup. Collab items can be repeated as
+    /// their status changes, but their immutable identity only needs one read per session.
+    seen_subagent_threads: HashSet<String>,
+    /// Spawned thread id → Agent card id. Child notifications share the parent's app-server
+    /// connection, so this mapping lets their activity enter the card's sub-timeline.
+    child_parent_tools: HashMap<String, String>,
+    /// Notifications and requests can race ahead of the parent's spawn item. Keep them isolated
+    /// until that item proves ownership; both dimensions are capped so unrelated threads cannot
+    /// grow session memory without bound.
+    deferred_thread_messages: HashMap<String, VecDeque<DeferredThreadEntry>>,
+    deferred_payload_bytes: usize,
+    next_deferred_sequence: u64,
     /// Extra writable directories from settings (`StartupCtx.add_dirs`). `thread/start`'s
     /// `sandbox` is a bare mode string and can't carry writable roots, so these are injected
     /// into the `workspaceWrite` `sandboxPolicy` on `turn/start` (persists server-side).
@@ -84,6 +143,12 @@ impl Default for CodexAppServer {
             next_client_id: 3,
             pending: HashMap::new(),
             client_waiters: HashMap::new(),
+            internal_waiters: HashMap::new(),
+            seen_subagent_threads: HashSet::new(),
+            child_parent_tools: HashMap::new(),
+            deferred_thread_messages: HashMap::new(),
+            deferred_payload_bytes: 0,
+            next_deferred_sequence: 0,
             add_dirs: Vec::new(),
             startup_overrides: CodexTurnOverrides::default(),
             pending_startup_replay: true,
@@ -96,10 +161,280 @@ impl CodexAppServer {
         Self::default()
     }
 
+    /// Expire unclaimed requests even while app-server stdout is quiet waiting for a response.
+    /// The actor calls this from its existing periodic timeout tick and writes returned frames.
+    pub fn expire_deferred(&mut self) -> Vec<Value> {
+        let mut out = ParsedLine::default();
+        self.expire_deferred_messages(&mut out);
+        out.outbound
+    }
+
     fn next_id(&mut self) -> i64 {
         let id = self.next_client_id;
         self.next_client_id += 1;
         id
+    }
+
+    /// Register newly spawned threads and request their identity. Codex 0.147 reports spawn via
+    /// `subAgentActivity.agentThreadId`; older spawnAgent payloads use `receiverThreadIds`.
+    fn register_subagents(
+        &mut self,
+        run_id: &str,
+        item: &Value,
+        containing_parent_tool_id: Option<&str>,
+        out: &mut ParsedLine,
+    ) {
+        // The frontend supports one sub-timeline level. Descendants therefore stay in the
+        // original top-level Agent card instead of targeting a nested Agent item as parent.
+        let parent_tool_id = containing_parent_tool_id
+            .or_else(|| item.get("id").and_then(Value::as_str))
+            .unwrap_or("");
+        let thread_ids: Vec<&str> = match item.get("type").and_then(Value::as_str) {
+            Some("subAgentActivity")
+                if item.get("kind").and_then(Value::as_str) == Some("started") =>
+            {
+                item.get("agentThreadId")
+                    .and_then(Value::as_str)
+                    .into_iter()
+                    .collect()
+            }
+            Some("collabAgentToolCall")
+                if item.get("tool").and_then(Value::as_str) == Some("spawnAgent") =>
+            {
+                item.get("receiverThreadIds")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect()
+            }
+            _ => return,
+        };
+
+        for thread_id in thread_ids {
+            if thread_id.is_empty() {
+                continue;
+            }
+            if !parent_tool_id.is_empty() {
+                self.child_parent_tools
+                    .insert(thread_id.to_string(), parent_tool_id.to_string());
+                self.replay_deferred_thread(run_id, thread_id, out);
+            }
+            if !self.seen_subagent_threads.insert(thread_id.to_string()) {
+                continue;
+            }
+
+            let id = self.next_id();
+            self.internal_waiters.insert(id, thread_id.to_string());
+            out.outbound.push(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "thread/read",
+                "params": { "threadId": thread_id, "includeTurns": false }
+            }));
+            log::debug!(
+                "[codex_appserver] sub-agent identity requested: thread_id={}, request_id={}",
+                thread_id,
+                id
+            );
+        }
+    }
+
+    fn defer_thread_message(
+        &mut self,
+        thread_id: &str,
+        message: DeferredThreadMessage,
+        out: &mut ParsedLine,
+    ) -> bool {
+        self.expire_deferred_messages(out);
+        let payload_bytes = message.payload_bytes();
+        if payload_bytes > MAX_DEFERRED_PAYLOAD_BYTES {
+            reject_deferred_interactive(message, "Interactive request exceeds buffer limit", out);
+            return false;
+        }
+        let interactive = message.is_interactive();
+        while self.deferred_thread_messages.len() >= MAX_UNCLAIMED_THREADS
+            && !self.deferred_thread_messages.contains_key(thread_id)
+        {
+            if !self.evict_oldest_deferred(interactive, out) {
+                reject_deferred_interactive(message, "Interactive request buffer is full", out);
+                return false;
+            }
+        }
+        while self
+            .deferred_thread_messages
+            .get(thread_id)
+            .is_some_and(|queue| queue.len() >= MAX_DEFERRED_MESSAGES_PER_THREAD)
+        {
+            if !self.evict_oldest_deferred_in_thread(thread_id, interactive, out) {
+                reject_deferred_interactive(message, "Interactive request buffer is full", out);
+                return false;
+            }
+        }
+        while self.deferred_payload_bytes + payload_bytes > MAX_DEFERRED_PAYLOAD_BYTES {
+            if !self.evict_oldest_deferred(interactive, out) {
+                reject_deferred_interactive(message, "Interactive request buffer is full", out);
+                return false;
+            }
+        }
+        let sequence = self.next_deferred_sequence;
+        self.next_deferred_sequence = self.next_deferred_sequence.wrapping_add(1);
+        self.deferred_payload_bytes += payload_bytes;
+        let queue = self
+            .deferred_thread_messages
+            .entry(thread_id.to_string())
+            .or_default();
+        queue.push_back(DeferredThreadEntry {
+            message,
+            received_at: Instant::now(),
+            sequence,
+            payload_bytes,
+        });
+        log::debug!(
+            "[codex_appserver] unclaimed thread message deferred: thread_id={}, queued={}, total_bytes={}",
+            thread_id,
+            queue.len(),
+            self.deferred_payload_bytes
+        );
+        true
+    }
+
+    fn evict_oldest_deferred_in_thread(
+        &mut self,
+        thread_id: &str,
+        incoming_interactive: bool,
+        out: &mut ParsedLine,
+    ) -> bool {
+        let Some(queue) = self.deferred_thread_messages.get(thread_id) else {
+            return false;
+        };
+        let oldest_notification = queue
+            .iter()
+            .find(|entry| !entry.message.is_interactive())
+            .map(|entry| entry.sequence);
+        let sequence = oldest_notification.or_else(|| {
+            incoming_interactive
+                .then(|| queue.front().map(|entry| entry.sequence))
+                .flatten()
+        });
+        let Some(sequence) = sequence else {
+            return false;
+        };
+        self.remove_deferred_entry(
+            thread_id,
+            sequence,
+            out,
+            "Interactive request evicted from buffer",
+        );
+        true
+    }
+
+    fn expire_deferred_messages(&mut self, out: &mut ParsedLine) {
+        let now = Instant::now();
+        let expired: Vec<(String, u64)> = self
+            .deferred_thread_messages
+            .iter()
+            .flat_map(|(thread_id, queue)| {
+                queue
+                    .iter()
+                    .take_while(|entry| {
+                        now.duration_since(entry.received_at) >= DEFERRED_MESSAGE_TTL
+                    })
+                    .map(|entry| (thread_id.clone(), entry.sequence))
+            })
+            .collect();
+        for (thread_id, sequence) in expired {
+            self.remove_deferred_entry(&thread_id, sequence, out, "Interactive request expired");
+        }
+    }
+
+    fn evict_oldest_deferred(&mut self, incoming_interactive: bool, out: &mut ParsedLine) -> bool {
+        let oldest_matching = |interactive: bool| {
+            self.deferred_thread_messages
+                .iter()
+                .flat_map(|(thread_id, queue)| {
+                    queue.iter().filter_map(move |entry| {
+                        (entry.message.is_interactive() == interactive)
+                            .then_some((thread_id.clone(), entry.sequence))
+                    })
+                })
+                .min_by_key(|(_, sequence)| *sequence)
+        };
+        // Ordinary notifications are disposable telemetry. Never evict an unanswered request
+        // for another notification; an incoming request may evict a request only after every
+        // buffered notification has already been removed.
+        let oldest = oldest_matching(false).or_else(|| {
+            incoming_interactive
+                .then(|| oldest_matching(true))
+                .flatten()
+        });
+        let Some((thread_id, sequence)) = oldest else {
+            return false;
+        };
+        self.remove_deferred_entry(
+            &thread_id,
+            sequence,
+            out,
+            "Interactive request evicted from buffer",
+        );
+        true
+    }
+
+    fn remove_deferred_entry(
+        &mut self,
+        thread_id: &str,
+        sequence: u64,
+        out: &mut ParsedLine,
+        reason: &str,
+    ) {
+        let mut removed = None;
+        let mut empty = false;
+        if let Some(queue) = self.deferred_thread_messages.get_mut(thread_id) {
+            if let Some(index) = queue.iter().position(|entry| entry.sequence == sequence) {
+                removed = queue.remove(index);
+            }
+            empty = queue.is_empty();
+        }
+        if empty {
+            self.deferred_thread_messages.remove(thread_id);
+        }
+        if let Some(entry) = removed {
+            self.deferred_payload_bytes = self
+                .deferred_payload_bytes
+                .saturating_sub(entry.payload_bytes);
+            reject_deferred_interactive(entry.message, reason, out);
+        }
+    }
+
+    fn replay_deferred_thread(&mut self, run_id: &str, thread_id: &str, out: &mut ParsedLine) {
+        let Some(mut messages) = self.deferred_thread_messages.remove(thread_id) else {
+            return;
+        };
+        log::debug!(
+            "[codex_appserver] replaying deferred thread messages: thread_id={}, count={}",
+            thread_id,
+            messages.len()
+        );
+        while let Some(entry) = messages.pop_front() {
+            self.deferred_payload_bytes = self
+                .deferred_payload_bytes
+                .saturating_sub(entry.payload_bytes);
+            if entry.received_at.elapsed() >= DEFERRED_MESSAGE_TTL {
+                reject_deferred_interactive(entry.message, "Interactive request expired", out);
+                continue;
+            }
+            match entry.message {
+                DeferredThreadMessage::Notification { method, params } => {
+                    self.handle_notification(run_id, &method, &params, out);
+                }
+                DeferredThreadMessage::Interactive { method, message } => {
+                    let replayed = self.handle_server_request(run_id, &method, &message);
+                    out.events.extend(replayed.events);
+                    out.interactive.extend(replayed.interactive);
+                    out.outbound.extend(replayed.outbound);
+                }
+            }
+        }
     }
 
     /// True once the thread is open and `turn/start` can be sent.
@@ -405,14 +740,26 @@ impl SessionProtocol for CodexAppServer {
     fn frame_interrupt(&mut self) -> Vec<Value> {
         let thread_id = match &self.thread_id {
             Some(t) => t.clone(),
-            None => return vec![],
+            None => {
+                log::warn!("[codex_appserver] frame_interrupt before thread/started — dropping");
+                return vec![];
+            }
+        };
+        // Codex 0.147 requires both ids. Without an active turn there is nothing valid to
+        // interrupt, and sending only threadId is rejected by the stable app-server schema.
+        let turn_id = match &self.active_turn_id {
+            Some(t) => t.clone(),
+            None => {
+                log::warn!("[codex_appserver] frame_interrupt with no active turn — dropping");
+                return vec![];
+            }
         };
         let id = self.next_id();
         vec![json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "turn/interrupt",
-            "params": { "threadId": thread_id }
+            "params": { "threadId": thread_id, "turnId": turn_id }
         })]
     }
 
@@ -480,6 +827,30 @@ impl SessionProtocol for CodexAppServer {
             return out;
         }
 
+        // Autonomous metadata replies are not frontend control responses. A failed identity
+        // lookup is non-fatal: the Agent card still renders with its thread id and live status.
+        if let Some(id) = msg.get("id").and_then(Value::as_i64) {
+            if let Some(thread_id) = self.internal_waiters.remove(&id) {
+                if let Some(thread) = msg.get("result").and_then(|r| r.get("thread")) {
+                    let string_field =
+                        |name: &str| thread.get(name).and_then(Value::as_str).map(str::to_string);
+                    out.events.push(BusEvent::CodexAgentInfo {
+                        run_id: run_id.to_string(),
+                        thread_id,
+                        nickname: string_field("agentNickname"),
+                        role: string_field("agentRole"),
+                        parent_thread_id: string_field("parentThreadId"),
+                    });
+                } else {
+                    log::debug!(
+                        "[codex_appserver] sub-agent identity unavailable: thread_id={}",
+                        thread_id
+                    );
+                }
+                return out;
+            }
+        }
+
         // Reply to one of our data-returning requests (id present in client_waiters, no method):
         // thread/fork, thread/rollback, thread/goal/get, … Route the JSON-RPC result (or error)
         // back to the actor's control waiter keyed by the frontend request_id.
@@ -509,6 +880,9 @@ impl SessionProtocol for CodexAppServer {
                 {
                     self.thread_id = Some(id.to_string());
                     out.thread_id = Some(id.to_string());
+                    // Root notifications can also race ahead of the thread/start reply that
+                    // proves ownership. Replay them now using the same bounded isolation path.
+                    self.replay_deferred_thread(run_id, id, &mut out);
                 }
             }
             self.phase = Phase::Ready;
@@ -521,27 +895,50 @@ impl SessionProtocol for CodexAppServer {
         kind: PendingKind,
         request_id: &str,
         response: Value,
-    ) -> Vec<Value> {
-        let pending = match self.pending.remove(request_id) {
-            Some(p) => p,
-            None => {
-                log::warn!("[codex_appserver] frame_response: unknown request_id {request_id}");
-                return vec![];
-            }
-        };
+    ) -> Result<Vec<Value>, String> {
+        self.validate_response(kind, request_id)?;
+        let pending = self
+            .pending
+            .remove(request_id)
+            .ok_or_else(|| format!("unknown Codex interactive request_id {request_id}"))?;
         let result = match kind {
+            // Codex currently has no hook callback request; the shared protocol kind exists for
+            // Claude, and validate_response prevents this branch from accepting a mismatched id.
+            PendingKind::Hook => response.clone(),
             PendingKind::Permission => {
-                // respond_permission sends {behavior: "allow"|"deny"} → Codex decision.
                 let behavior = response
                     .get("behavior")
                     .and_then(|v| v.as_str())
                     .unwrap_or("deny");
-                let decision = if behavior == "allow" {
-                    "accept"
+                if pending.method == M_PERM_APPROVAL {
+                    // Permission-profile requests use a granted subset, not the decision enum
+                    // used by command/file approvals. An empty profile denies every request.
+                    let permissions = if behavior == "allow" {
+                        pending
+                            .requested_permissions
+                            .clone()
+                            .unwrap_or_else(|| json!({}))
+                    } else {
+                        json!({})
+                    };
+                    log::debug!(
+                        "[codex_appserver] permissions response: request_id={}, behavior={}",
+                        request_id,
+                        behavior
+                    );
+                    json!({ "permissions": permissions, "scope": "turn" })
                 } else {
-                    "decline"
-                };
-                json!({ "decision": decision })
+                    // A deny-and-stop action maps to Codex's cancel decision for command/file
+                    // approvals. Plain deny keeps the current turn alive with decline.
+                    let decision = if behavior == "allow" {
+                        "accept"
+                    } else if response.get("interrupt").and_then(Value::as_bool) == Some(true) {
+                        "cancel"
+                    } else {
+                        "decline"
+                    };
+                    json!({ "decision": decision })
+                }
             }
             PendingKind::Elicitation => {
                 // respond_elicitation sends {action, content?}.
@@ -562,8 +959,34 @@ impl SessionProtocol for CodexAppServer {
                 build_user_input_result(&response)
             }
         };
-        let _ = pending.method; // method retained for diagnostics/future shape variance.
-        vec![json!({ "jsonrpc": "2.0", "id": pending.raw_id, "result": result })]
+        let mut frames = vec![json!({
+            "jsonrpc": "2.0",
+            "id": pending.raw_id,
+            "result": result
+        })];
+        // The permission-profile response has no cancel decision. Preserve the UI's
+        // deny-and-stop contract by denying the grant first, then interrupting the active turn.
+        if pending.method == M_PERM_APPROVAL
+            && response.get("behavior").and_then(Value::as_str) != Some("allow")
+            && response.get("interrupt").and_then(Value::as_bool) == Some(true)
+        {
+            frames.extend(self.frame_interrupt());
+        }
+        Ok(frames)
+    }
+
+    fn validate_response(&self, kind: PendingKind, request_id: &str) -> Result<(), String> {
+        let pending = self
+            .pending
+            .get(request_id)
+            .ok_or_else(|| format!("unknown Codex interactive request_id {request_id}"))?;
+        if pending.kind != kind {
+            return Err(format!(
+                "Codex interactive request kind mismatch for {request_id}: expected {:?}, got {kind:?}",
+                pending.kind
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -578,6 +1001,10 @@ fn is_interactive_method(method: &str) -> bool {
             | M_REQUEST_USER_INPUT
             | M_ELICITATION
     )
+}
+
+fn is_legacy_interactive_method(method: &str) -> bool {
+    matches!(method, M_CMD_APPROVAL_LEGACY | M_FILE_APPROVAL_LEGACY)
 }
 
 /// Convert the frontend's `{answers: {qid: [labels]}}` into Codex's
@@ -606,23 +1033,88 @@ impl CodexAppServer {
         let raw_id = msg.get("id").cloned().unwrap_or(Value::Null);
         let request_id = req_id_str(&raw_id);
         let params = msg.get("params").cloned().unwrap_or(Value::Null);
+        let request_thread = params.get("threadId").and_then(Value::as_str);
+        // Stable app-server requests always carry threadId. Only the two pre-v2 approval
+        // methods predate that field, so keeping their compatibility cannot weaken v2 routing.
+        if !is_legacy_interactive_method(method) && request_thread.is_none_or(str::is_empty) {
+            log::warn!(
+                "[codex_appserver] interactive request missing thread id: method={}",
+                method
+            );
+            out.outbound.push(json!({
+                "jsonrpc": "2.0",
+                "id": raw_id,
+                "error": {
+                    "code": -32602,
+                    "message": "Interactive request is missing threadId"
+                }
+            }));
+            return out;
+        }
+        let parent_tool_id = request_thread
+            .and_then(|id| self.child_parent_tools.get(id))
+            .map(String::as_str);
+        if request_thread.is_some_and(|id| {
+            self.thread_id.as_deref() != Some(id) && !self.child_parent_tools.contains_key(id)
+        }) {
+            let thread_id = request_thread.unwrap_or_default();
+            if self.defer_thread_message(
+                thread_id,
+                DeferredThreadMessage::Interactive {
+                    method: method.to_string(),
+                    message: msg.clone(),
+                },
+                &mut out,
+            ) {
+                return out;
+            }
+            log::warn!(
+                "[codex_appserver] unclaimed interactive request rejected at buffer limit: method={}, thread_id={}",
+                method,
+                thread_id
+            );
+            return out;
+        }
+        log::debug!(
+            "[codex_appserver] interactive request: method={}, request_id={}",
+            method,
+            request_id
+        );
 
         let (kind, events) = match method {
             M_CMD_APPROVAL | M_CMD_APPROVAL_LEGACY => (
                 PendingKind::Permission,
-                vec![approval_prompt(run_id, &request_id, "Bash", &params)],
+                vec![approval_prompt(
+                    run_id,
+                    &request_id,
+                    "Bash",
+                    &params,
+                    parent_tool_id,
+                )],
             ),
             M_FILE_APPROVAL | M_FILE_APPROVAL_LEGACY => (
                 PendingKind::Permission,
-                vec![approval_prompt(run_id, &request_id, "Edit", &params)],
+                vec![approval_prompt(
+                    run_id,
+                    &request_id,
+                    "Edit",
+                    &params,
+                    parent_tool_id,
+                )],
             ),
             M_PERM_APPROVAL => (
                 PendingKind::Permission,
-                vec![approval_prompt(run_id, &request_id, "Bash", &params)],
+                vec![approval_prompt(
+                    run_id,
+                    &request_id,
+                    "RequestPermissions",
+                    &params,
+                    parent_tool_id,
+                )],
             ),
             M_REQUEST_USER_INPUT => (
                 PendingKind::UserInput,
-                ask_user_question_events(run_id, &request_id, &params),
+                ask_user_question_events(run_id, &request_id, &params, parent_tool_id),
             ),
             M_ELICITATION => (
                 PendingKind::Elicitation,
@@ -636,10 +1128,17 @@ impl CodexAppServer {
             PendingServerReq {
                 raw_id,
                 method: method.to_string(),
+                kind,
+                requested_permissions: if method == M_PERM_APPROVAL {
+                    params.get("permissions").cloned()
+                } else {
+                    None
+                },
             },
         );
         out.events = events;
-        out.interactive = Some(PendingInteractive { request_id, kind });
+        out.interactive
+            .push(PendingInteractive { request_id, kind });
         out
     }
 
@@ -650,6 +1149,61 @@ impl CodexAppServer {
         params: &Value,
         out: &mut ParsedLine,
     ) {
+        let notification_thread = params.get("threadId").and_then(Value::as_str);
+        let parent_tool = notification_thread
+            .and_then(|id| self.child_parent_tools.get(id))
+            .cloned();
+        let is_child = parent_tool.is_some();
+        let parent_tool_id = parent_tool.as_deref();
+        let is_foreign = notification_thread.is_some_and(|id| {
+            self.thread_id.as_deref() != Some(id) && !self.child_parent_tools.contains_key(id)
+        });
+
+        // Codex app-server can multiplex notifications from multiple active threads. Until a
+        // spawn item proves the relationship, isolate the thread so it cannot mutate this run.
+        if is_foreign && method != "thread/started" {
+            let thread_id = notification_thread.unwrap_or_default();
+            if !self.defer_thread_message(
+                thread_id,
+                DeferredThreadMessage::Notification {
+                    method: method.to_string(),
+                    params: params.clone(),
+                },
+                out,
+            ) {
+                log::warn!(
+                    "[codex_appserver] unclaimed notification dropped at buffer limit: method={}, thread_id={}",
+                    method,
+                    thread_id
+                );
+            }
+            return;
+        }
+
+        if is_child
+            && !matches!(
+                method,
+                "turn/started"
+                    | "turn/completed"
+                    | "turn/failed"
+                    | "error"
+                    | "item/agentMessage/delta"
+                    | "item/reasoning/textDelta"
+                    | "item/reasoning/summaryTextDelta"
+                    | "item/started"
+                    | "item/completed"
+                    | "item/commandExecution/outputDelta"
+                    | "item/mcpToolCall/progress"
+            )
+        {
+            log::debug!(
+                "[codex_appserver] sub-agent state notification ignored: method={}, thread_id={}",
+                method,
+                notification_thread.unwrap_or_default()
+            );
+            return;
+        }
+
         match method {
             "thread/started" => {
                 if let Some(id) = params
@@ -657,12 +1211,20 @@ impl CodexAppServer {
                     .and_then(|t| t.get("id"))
                     .and_then(|v| v.as_str())
                 {
-                    self.thread_id = Some(id.to_string());
-                    out.thread_id = Some(id.to_string());
+                    if self.thread_id.as_deref() == Some(id) {
+                        out.thread_id = Some(id.to_string());
+                        self.phase = Phase::Ready;
+                    } else {
+                        // The id:2 thread/start|resume reply is the authoritative root. Global
+                        // app-server notifications can be interleaved before that reply arrives.
+                        log::debug!(
+                            "[codex_appserver] uncorrelated thread/started ignored: thread_id={}",
+                            id
+                        );
+                    }
                 }
-                self.phase = Phase::Ready;
             }
-            "turn/started" => {
+            "turn/started" if !is_child => {
                 // Capture the active turn id (TurnStartedNotification.turn.id) for turn/steer's
                 // `expectedTurnId`. `params` is sometimes `{}` — tolerate the absence.
                 if let Some(id) = params
@@ -674,11 +1236,11 @@ impl CodexAppServer {
                 }
                 out.lifecycle = Some(LifecycleSignal::TurnStarted);
             }
-            "turn/completed" => {
+            "turn/completed" if !is_child => {
                 self.active_turn_id = None;
                 out.lifecycle = Some(LifecycleSignal::TurnCompleted);
             }
-            "turn/failed" => {
+            "turn/failed" if !is_child => {
                 self.active_turn_id = None;
                 let err = params
                     .get("error")
@@ -687,6 +1249,9 @@ impl CodexAppServer {
                     .map(|s| s.to_string());
                 out.lifecycle = Some(LifecycleSignal::TurnFailed(err));
             }
+            // Child turns are represented by the parent collab item. They must not transition
+            // the top-level run or replace the parent's active turn id.
+            "turn/started" | "turn/completed" | "turn/failed" => {}
             "error" => {
                 // ErrorNotification = { error: TurnError, willRetry: bool, threadId, turnId }.
                 // The message lives in `error.message` (a TurnError) — NOT a top-level `message`.
@@ -706,6 +1271,8 @@ impl CodexAppServer {
                     .unwrap_or(false);
                 if will_retry {
                     log::debug!("[codex] transient error (will retry): {m}");
+                } else if is_child {
+                    log::debug!("[codex] sub-agent terminal error: {m}");
                 } else {
                     // Terminal error — the turn is over; drop the stale id so a later
                     // steer doesn't target a turn that's no longer running.
@@ -721,7 +1288,7 @@ impl CodexAppServer {
                     out.events.push(BusEvent::MessageDelta {
                         run_id: run_id.to_string(),
                         text: delta.to_string(),
-                        parent_tool_use_id: None,
+                        parent_tool_use_id: parent_tool_id.map(str::to_string),
                     });
                 }
             }
@@ -730,23 +1297,25 @@ impl CodexAppServer {
                     out.events.push(BusEvent::ThinkingDelta {
                         run_id: run_id.to_string(),
                         text: delta.to_string(),
-                        parent_tool_use_id: None,
+                        parent_tool_use_id: parent_tool_id.map(str::to_string),
                     });
                 }
             }
             "item/started" => {
                 if let Some(item) = params.get("item") {
-                    if let Some(ev) = item_started_event(run_id, item) {
+                    if let Some(ev) = item_started_event(run_id, item, parent_tool_id) {
                         out.events.push(ev);
                     }
+                    self.register_subagents(run_id, item, parent_tool_id, out);
                 }
             }
             "item/completed" => {
                 if let Some(item) = params.get("item") {
-                    item_completed_events(run_id, item, &mut out.events);
+                    item_completed_events(run_id, item, parent_tool_id, &mut out.events);
+                    self.register_subagents(run_id, item, parent_tool_id, out);
                 }
             }
-            "thread/tokenUsage/updated" => {
+            "thread/tokenUsage/updated" if !is_child => {
                 if let Some(ev) = token_usage_event(run_id, params) {
                     out.events.push(ev);
                 }
@@ -786,7 +1355,7 @@ impl CodexAppServer {
                             run_id: run_id.to_string(),
                             tool_use_id: id.to_string(),
                             delta: delta.to_string(),
-                            parent_tool_use_id: None,
+                            parent_tool_use_id: parent_tool_id.map(str::to_string),
                         });
                     }
                 }
@@ -904,7 +1473,7 @@ impl CodexAppServer {
                             run_id: run_id.to_string(),
                             tool_use_id: id.to_string(),
                             delta: format!("{msg}\n"),
-                            parent_tool_use_id: None,
+                            parent_tool_use_id: parent_tool_id.map(str::to_string),
                         });
                     }
                 }
@@ -956,7 +1525,13 @@ impl CodexAppServer {
 
 // ── ServerRequest → interactive BusEvent ──────────────────────────────────────────────
 
-fn approval_prompt(run_id: &str, request_id: &str, tool_name: &str, params: &Value) -> BusEvent {
+fn approval_prompt(
+    run_id: &str,
+    request_id: &str,
+    tool_name: &str,
+    params: &Value,
+    parent_tool_id: Option<&str>,
+) -> BusEvent {
     let command = params
         .get("command")
         .and_then(|v| v.as_str())
@@ -980,6 +1555,9 @@ fn approval_prompt(run_id: &str, request_id: &str, tool_name: &str, params: &Val
     if let Some(c) = cwd {
         input.insert("cwd".into(), c);
     }
+    if let Some(permissions) = params.get("permissions") {
+        input.insert("permissions".into(), permissions.clone());
+    }
     // Carry the file-change patch through verbatim if present.
     if let Some(changes) = params.get("changes") {
         input.insert("changes".into(), changes.clone());
@@ -992,7 +1570,7 @@ fn approval_prompt(run_id: &str, request_id: &str, tool_name: &str, params: &Val
         tool_use_id: item_id,
         tool_input: Value::Object(input),
         decision_reason: reason,
-        parent_tool_use_id: None,
+        parent_tool_use_id: parent_tool_id.map(str::to_string),
         suggestions: vec![],
     }
 }
@@ -1000,7 +1578,12 @@ fn approval_prompt(run_id: &str, request_id: &str, tool_name: &str, params: &Val
 /// Map `item/tool/requestUserInput` to an AskUserQuestion tool (ToolStart + ToolEnd) so it
 /// renders in the existing `InlineToolCard`. `tool_use_id == request_id` so the frontend can
 /// route the answer back via `respond_user_input`.
-fn ask_user_question_events(run_id: &str, request_id: &str, params: &Value) -> Vec<BusEvent> {
+fn ask_user_question_events(
+    run_id: &str,
+    request_id: &str,
+    params: &Value,
+    parent_tool_id: Option<&str>,
+) -> Vec<BusEvent> {
     let mut questions = vec![];
     if let Some(arr) = params.get("questions").and_then(|v| v.as_array()) {
         for q in arr {
@@ -1033,7 +1616,7 @@ fn ask_user_question_events(run_id: &str, request_id: &str, params: &Value) -> V
             tool_use_id: request_id.to_string(),
             tool_name: "AskUserQuestion".to_string(),
             input: input.clone(),
-            parent_tool_use_id: None,
+            parent_tool_use_id: parent_tool_id.map(str::to_string),
         },
         BusEvent::ToolEnd {
             run_id: run_id.to_string(),
@@ -1044,7 +1627,7 @@ fn ask_user_question_events(run_id: &str, request_id: &str, params: &Value) -> V
             // that's the state that renders the interactive option buttons (InlineToolCard).
             status: "error".to_string(),
             duration_ms: None,
-            parent_tool_use_id: None,
+            parent_tool_use_id: parent_tool_id.map(str::to_string),
             tool_use_result: None,
         },
     ]
@@ -1100,11 +1683,8 @@ fn item_tool_name(item: &Value) -> Option<String> {
             let tool = item.get("tool").and_then(|v| v.as_str()).unwrap_or("tool");
             Some(format!("{server}:{tool}"))
         }
-        // `collabToolCall` IS reachable over app-server (multi-agent / spawn_agent sessions), but
-        // this transport's `item_started_event` only copies a `command` field — it has none of the
-        // collab fields (tool/prompt/agents_states), so rendering it would yield an empty Agent
-        // card. The app-server path has never rendered collab items; preserve that (return None)
-        // until the collab fields are properly extracted. The exec parser DOES render them.
+        // Collab items are handled before this generic mapper because they need their full
+        // operation/agent payload rather than the command-only input assembled below.
         CodexToolKind::CollabToolCall => None,
         kind => kind.fixed_tool_name().map(|s| s.to_string()),
     }
@@ -1136,17 +1716,70 @@ fn collab_input(item: &Value) -> Value {
         "model": item.get("model").and_then(|v| v.as_str()),
         "reasoningEffort": item.get("reasoningEffort").and_then(|v| v.as_str()),
         "status": item.get("status").and_then(|v| v.as_str()),
+        "senderThreadId": item.get("senderThreadId").and_then(|v| v.as_str()),
         "receiverThreadIds": item.get("receiverThreadIds").cloned().unwrap_or(json!([])),
         "agents": agents,
     })
 }
 
-fn item_started_event(run_id: &str, item: &Value) -> Option<BusEvent> {
+fn subagent_activity_input(item: &Value, completed: bool) -> Value {
+    let thread_id = item
+        .get("agentThreadId")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let kind = item.get("kind").and_then(Value::as_str).unwrap_or("");
+    let operation = match kind {
+        "started" => "spawnAgent",
+        "interacted" => "interacted",
+        "interrupted" => "interrupted",
+        _ => "subAgentActivity",
+    };
+    let activity_status = if kind == "interrupted" {
+        "interrupted"
+    } else if completed {
+        "completed"
+    } else {
+        "inProgress"
+    };
+    let agent_status = if kind == "interrupted" {
+        "interrupted"
+    } else {
+        "running"
+    };
+    json!({
+        "codexCollab": true,
+        "operation": operation,
+        "activityKind": kind,
+        "status": activity_status,
+        "agentPath": item.get("agentPath").and_then(Value::as_str),
+        "receiverThreadIds": if thread_id.is_empty() { json!([]) } else { json!([thread_id]) },
+        "agents": if thread_id.is_empty() {
+            json!([])
+        } else {
+            json!([{ "thread_id": thread_id, "status": agent_status, "message": null }])
+        }
+    })
+}
+
+fn item_started_event(
+    run_id: &str,
+    item: &Value,
+    parent_tool_id: Option<&str>,
+) -> Option<BusEvent> {
     let id = item
         .get("id")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    if item.get("type").and_then(Value::as_str) == Some("subAgentActivity") {
+        return Some(BusEvent::ToolStart {
+            run_id: run_id.to_string(),
+            tool_use_id: id,
+            tool_name: "Agent".to_string(),
+            input: subagent_activity_input(item, false),
+            parent_tool_use_id: parent_tool_id.map(str::to_string),
+        });
+    }
     // Codex multi-agent: collabAgentToolCall (spawn_agent etc.) renders as an "Agent" subagent
     // card. item_tool_name doesn't cover it (it's not a plain tool), so handle it up front —
     // otherwise it's dropped entirely on the app-server path.
@@ -1156,7 +1789,7 @@ fn item_started_event(run_id: &str, item: &Value) -> Option<BusEvent> {
             tool_use_id: id,
             tool_name: "Agent".to_string(),
             input: collab_input(item),
-            parent_tool_use_id: None,
+            parent_tool_use_id: parent_tool_id.map(str::to_string),
         });
     }
     let tool_name = item_tool_name(item)?;
@@ -1169,12 +1802,41 @@ fn item_started_event(run_id: &str, item: &Value) -> Option<BusEvent> {
         tool_use_id: id,
         tool_name,
         input: Value::Object(input),
-        parent_tool_use_id: None,
+        parent_tool_use_id: parent_tool_id.map(str::to_string),
     })
 }
 
-fn item_completed_events(run_id: &str, item: &Value, out: &mut Vec<BusEvent>) {
+fn item_completed_events(
+    run_id: &str,
+    item: &Value,
+    parent_tool_id: Option<&str>,
+    out: &mut Vec<BusEvent>,
+) {
     let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if item_type == "subAgentActivity" {
+        let id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let payload = subagent_activity_input(item, true);
+        let status = if item.get("kind").and_then(Value::as_str) == Some("interrupted") {
+            "error"
+        } else {
+            "success"
+        };
+        out.push(BusEvent::ToolEnd {
+            run_id: run_id.to_string(),
+            tool_use_id: id,
+            tool_name: "Agent".to_string(),
+            output: json!({ "content": payload.clone() }),
+            status: status.to_string(),
+            duration_ms: None,
+            parent_tool_use_id: parent_tool_id.map(str::to_string),
+            tool_use_result: Some(payload),
+        });
+        return;
+    }
     if item_type == "agentMessage" {
         let text = item.get("text").and_then(|v| v.as_str()).unwrap_or("");
         let id = item
@@ -1186,7 +1848,7 @@ fn item_completed_events(run_id: &str, item: &Value, out: &mut Vec<BusEvent>) {
             run_id: run_id.to_string(),
             message_id: id,
             text: text.to_string(),
-            parent_tool_use_id: None,
+            parent_tool_use_id: parent_tool_id.map(str::to_string),
             model: None,
             stop_reason: None,
             message_usage: None,
@@ -1226,7 +1888,7 @@ fn item_completed_events(run_id: &str, item: &Value, out: &mut Vec<BusEvent>) {
             output: json!({ "content": payload.clone() }),
             status: status.to_string(),
             duration_ms: None,
-            parent_tool_use_id: None,
+            parent_tool_use_id: parent_tool_id.map(str::to_string),
             tool_use_result: Some(payload),
         });
         return;
@@ -1253,7 +1915,7 @@ fn item_completed_events(run_id: &str, item: &Value, out: &mut Vec<BusEvent>) {
             output: json!({ "content": output }),
             status: status.to_string(),
             duration_ms: None,
-            parent_tool_use_id: None,
+            parent_tool_use_id: parent_tool_id.map(str::to_string),
             tool_use_result: None,
         });
     }
@@ -1474,10 +2136,7 @@ mod tests {
 
     fn ready_server() -> CodexAppServer {
         let mut s = CodexAppServer::new();
-        s.parse_line(
-            "run1",
-            r#"{"method":"thread/started","params":{"thread":{"id":"th-123"}}}"#,
-        );
+        s.parse_line("run1", r#"{"id":2,"result":{"thread":{"id":"th-123"}}}"#);
         s
     }
 
@@ -1519,14 +2178,14 @@ mod tests {
     }
 
     #[test]
-    fn thread_started_captures_id_and_readies() {
+    fn uncorrelated_thread_started_is_ignored() {
         let mut s = CodexAppServer::new();
         let out = s.parse_line(
             "run1",
             r#"{"method":"thread/started","params":{"thread":{"id":"th-123"}}}"#,
         );
-        assert_eq!(out.thread_id.as_deref(), Some("th-123"));
-        assert_eq!(s.phase, Phase::Ready);
+        assert!(out.thread_id.is_none());
+        assert_eq!(s.phase, Phase::Opening);
     }
 
     #[test]
@@ -1841,9 +2500,9 @@ mod tests {
     #[test]
     fn command_approval_request() {
         let mut s = ready_server();
-        let line = r#"{"id":0,"method":"item/commandExecution/requestApproval","params":{"itemId":"call_1","reason":"allow write?","command":"echo hi","cwd":"/tmp"}}"#;
+        let line = r#"{"id":0,"method":"item/commandExecution/requestApproval","params":{"threadId":"th-123","turnId":"turn-1","itemId":"call_1","startedAtMs":1,"reason":"allow write?","command":"echo hi","cwd":"/tmp"}}"#;
         let out = s.parse_line("run1", line);
-        let pi = out.interactive.expect("interactive");
+        let pi = out.interactive.first().expect("interactive");
         assert_eq!(pi.kind, PendingKind::Permission);
         assert_eq!(pi.request_id, "0");
         match &out.events[0] {
@@ -1860,22 +2519,188 @@ mod tests {
             e => panic!("expected PermissionPrompt, got {e:?}"),
         }
         // Allow → {decision:"accept"} on id 0.
-        let resp = s.frame_response(PendingKind::Permission, "0", json!({"behavior":"allow"}));
+        let resp = s
+            .frame_response(PendingKind::Permission, "0", json!({"behavior":"allow"}))
+            .unwrap();
         assert_eq!(resp[0]["id"], 0);
         assert_eq!(resp[0]["result"]["decision"], "accept");
         // Deny path.
         let mut s2 = ready_server();
         s2.parse_line("run1", line);
-        let resp2 = s2.frame_response(PendingKind::Permission, "0", json!({"behavior":"deny"}));
+        let resp2 = s2
+            .frame_response(PendingKind::Permission, "0", json!({"behavior":"deny"}))
+            .unwrap();
         assert_eq!(resp2[0]["result"]["decision"], "decline");
+
+        let mut s3 = ready_server();
+        s3.parse_line("run1", line);
+        let resp3 = s3
+            .frame_response(
+                PendingKind::Permission,
+                "0",
+                json!({"behavior":"deny", "interrupt":true}),
+            )
+            .unwrap();
+        assert_eq!(resp3[0]["result"]["decision"], "cancel");
+    }
+
+    #[test]
+    fn legacy_approval_without_thread_id_remains_supported() {
+        let mut server = ready_server();
+        let out = server.parse_line(
+            "r",
+            r#"{"id":87,"method":"execCommandApproval","params":{"itemId":"cmd-1","command":"pwd"}}"#,
+        );
+
+        assert!(matches!(
+            out.interactive.first(),
+            Some(PendingInteractive {
+                kind: PendingKind::Permission,
+                ..
+            })
+        ));
+        assert!(matches!(
+            out.events.first(),
+            Some(BusEvent::PermissionPrompt { .. })
+        ));
+        assert!(out.outbound.is_empty());
+    }
+
+    #[test]
+    fn modern_interactive_request_without_thread_id_is_rejected() {
+        for (index, method) in [
+            M_CMD_APPROVAL,
+            M_FILE_APPROVAL,
+            M_PERM_APPROVAL,
+            M_REQUEST_USER_INPUT,
+            M_ELICITATION,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for params in [json!({}), json!({ "threadId": "" })] {
+                let mut server = ready_server();
+                let out = server.parse_line(
+                    "r",
+                    &json!({
+                        "id": 90 + index,
+                        "method": method,
+                        "params": params,
+                    })
+                    .to_string(),
+                );
+
+                assert!(out.events.is_empty(), "method={method}");
+                assert!(out.interactive.is_empty(), "method={method}");
+                assert_eq!(out.outbound[0]["error"]["code"], -32602, "method={method}");
+                assert!(server.pending.is_empty(), "method={method}");
+            }
+        }
+    }
+
+    #[test]
+    fn unclaimed_interactive_request_evicts_notification_when_thread_buffer_is_full() {
+        let mut server = ready_server();
+        for index in 0..MAX_DEFERRED_MESSAGES_PER_THREAD {
+            let line = json!({
+                "method": "item/agentMessage/delta",
+                "params": {"threadId": "another-thread", "delta": index.to_string()}
+            });
+            assert!(server.parse_line("r", &line.to_string()).events.is_empty());
+        }
+        let out = server.parse_line(
+            "r",
+            r#"{"id":88,"method":"item/commandExecution/requestApproval","params":{"threadId":"another-thread","turnId":"turn-1","itemId":"cmd-1","startedAtMs":1,"command":"touch foreign"}}"#,
+        );
+
+        assert!(out.events.is_empty());
+        assert!(out.interactive.is_empty());
+        assert!(out.outbound.is_empty());
+        assert!(server.pending.is_empty());
+        let queue = &server.deferred_thread_messages["another-thread"];
+        assert_eq!(queue.len(), MAX_DEFERRED_MESSAGES_PER_THREAD);
+        assert_eq!(
+            queue
+                .iter()
+                .filter(|entry| entry.message.is_interactive())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn permissions_approval_returns_granted_subset_or_empty_profile() {
+        let line = r#"{"id":61,"method":"item/permissions/requestApproval","params":{"threadId":"th-123","turnId":"turn-1","itemId":"call-1","cwd":"/project","reason":"Allow workspace writes","permissions":{"fileSystem":{"write":["/project","/shared"]},"network":{"enabled":true}}}}"#;
+
+        let mut allowed = ready_server();
+        let out = allowed.parse_line("run1", line);
+        let pi = out.interactive.first().expect("interactive");
+        assert_eq!(pi.kind, PendingKind::Permission);
+        match &out.events[0] {
+            BusEvent::PermissionPrompt {
+                tool_name,
+                tool_input,
+                decision_reason,
+                ..
+            } => {
+                assert_eq!(tool_name, "RequestPermissions");
+                assert_eq!(tool_input["cwd"], "/project");
+                assert_eq!(tool_input["permissions"]["network"]["enabled"], true);
+                assert_eq!(decision_reason, "Allow workspace writes");
+            }
+            event => panic!("expected PermissionPrompt, got {event:?}"),
+        }
+        let response = allowed
+            .frame_response(
+                PendingKind::Permission,
+                &pi.request_id,
+                json!({"behavior":"allow"}),
+            )
+            .unwrap();
+        assert_eq!(response[0]["id"], 61);
+        assert_eq!(
+            response[0]["result"]["permissions"],
+            json!({
+                "fileSystem": {"write": ["/project", "/shared"]},
+                "network": {"enabled": true}
+            })
+        );
+        assert_eq!(response[0]["result"]["scope"], "turn");
+        assert!(response[0]["result"].get("decision").is_none());
+
+        let mut denied = ready_server();
+        denied.parse_line(
+            "run1",
+            r#"{"method":"turn/started","params":{"turn":{"id":"turn-1"}}}"#,
+        );
+        let out = denied.parse_line("run1", line);
+        let request_id = out
+            .interactive
+            .first()
+            .expect("interactive")
+            .request_id
+            .clone();
+        let response = denied
+            .frame_response(
+                PendingKind::Permission,
+                &request_id,
+                json!({"behavior":"deny", "interrupt":true}),
+            )
+            .unwrap();
+        assert_eq!(response[0]["result"]["permissions"], json!({}));
+        assert_eq!(response[0]["result"]["scope"], "turn");
+        assert!(response[0]["result"].get("decision").is_none());
+        assert_eq!(response[1]["method"], "turn/interrupt");
+        assert_eq!(response[1]["params"]["threadId"], "th-123");
+        assert_eq!(response[1]["params"]["turnId"], "turn-1");
     }
 
     #[test]
     fn request_user_input_to_ask_question_and_back() {
         let mut s = ready_server();
-        let line = r#"{"id":0,"method":"item/tool/requestUserInput","params":{"questions":[{"id":"word","header":"Word","question":"Which word?","isOther":true,"isSecret":false,"options":[{"label":"FOO","description":"Select FOO."},{"label":"BAR","description":"Select BAR."}]}]}}"#;
+        let line = r#"{"id":0,"method":"item/tool/requestUserInput","params":{"threadId":"th-123","turnId":"turn-1","itemId":"ask-1","isBlocking":true,"questions":[{"id":"word","header":"Word","question":"Which word?","isOther":true,"isSecret":false,"options":[{"label":"FOO","description":"Select FOO."},{"label":"BAR","description":"Select BAR."}]}]}}"#;
         let out = s.parse_line("run1", line);
-        let pi = out.interactive.expect("interactive");
+        let pi = out.interactive.first().expect("interactive");
         assert_eq!(pi.kind, PendingKind::UserInput);
         // Renders as AskUserQuestion ToolStart+ToolEnd with tool_use_id == request_id.
         match &out.events[0] {
@@ -1898,11 +2723,13 @@ mod tests {
             e => panic!("expected ToolEnd, got {e:?}"),
         }
         // Answer "FOO" → Codex map shape {answers:{word:{answers:["FOO"]}}} on id 0.
-        let resp = s.frame_response(
-            PendingKind::UserInput,
-            "0",
-            json!({"answers": {"word": ["FOO"]}}),
-        );
+        let resp = s
+            .frame_response(
+                PendingKind::UserInput,
+                "0",
+                json!({"answers": {"word": ["FOO"]}}),
+            )
+            .unwrap();
         assert_eq!(resp[0]["id"], 0);
         assert_eq!(resp[0]["result"]["answers"]["word"]["answers"][0], "FOO");
     }
@@ -1910,9 +2737,12 @@ mod tests {
     #[test]
     fn elicitation_request() {
         let mut s = ready_server();
-        let line = r#"{"id":1,"method":"mcpServer/elicitation/request","params":{"serverName":"srv","mode":"form","message":"Pick","requestedSchema":{"type":"object"}}}"#;
+        let line = r#"{"id":1,"method":"mcpServer/elicitation/request","params":{"threadId":"th-123","serverName":"srv","mode":"form","message":"Pick","requestedSchema":{"type":"object"}}}"#;
         let out = s.parse_line("run1", line);
-        assert_eq!(out.interactive.unwrap().kind, PendingKind::Elicitation);
+        assert_eq!(
+            out.interactive.first().expect("interactive").kind,
+            PendingKind::Elicitation
+        );
         match &out.events[0] {
             BusEvent::ElicitationPrompt {
                 mcp_server_name,
@@ -1926,7 +2756,9 @@ mod tests {
             }
             e => panic!("expected ElicitationPrompt, got {e:?}"),
         }
-        let resp = s.frame_response(PendingKind::Elicitation, "1", json!({"action":"decline"}));
+        let resp = s
+            .frame_response(PendingKind::Elicitation, "1", json!({"action":"decline"}))
+            .unwrap();
         assert_eq!(resp[0]["result"]["action"], "decline");
     }
 
@@ -1994,6 +2826,448 @@ mod tests {
             }
             e => panic!("expected ToolEnd, got {e:?}"),
         }
+    }
+
+    #[test]
+    fn spawned_thread_identity_and_activity_are_correlated() {
+        let mut server = ready_server();
+        let spawn = server.parse_line(
+            "r",
+            r#"{"method":"item/completed","params":{"threadId":"th-123","item":{"id":"agent-1","type":"collabAgentToolCall","tool":"spawnAgent","status":"completed","senderThreadId":"th-123","receiverThreadIds":["child-1"],"agentsStates":{"child-1":{"status":"running","message":null}}}}}"#,
+        );
+        let read = spawn
+            .outbound
+            .iter()
+            .find(|frame| frame["method"] == "thread/read")
+            .expect("spawn schedules identity lookup");
+        assert_eq!(read["params"]["threadId"], "child-1");
+        assert_eq!(read["params"]["includeTurns"], false);
+
+        let read_id = read["id"].as_i64().unwrap();
+        let info = server.parse_line(
+            "r",
+            &format!(
+                r#"{{"id":{read_id},"result":{{"thread":{{"id":"child-1","agentNickname":"Dewey","agentRole":"explorer","parentThreadId":"th-123"}}}}}}"#
+            ),
+        );
+        match &info.events[0] {
+            BusEvent::CodexAgentInfo {
+                thread_id,
+                nickname,
+                role,
+                parent_thread_id,
+                ..
+            } => {
+                assert_eq!(thread_id, "child-1");
+                assert_eq!(nickname.as_deref(), Some("Dewey"));
+                assert_eq!(role.as_deref(), Some("explorer"));
+                assert_eq!(parent_thread_id.as_deref(), Some("th-123"));
+            }
+            event => panic!("expected CodexAgentInfo, got {event:?}"),
+        }
+
+        let child_tool = server.parse_line(
+            "r",
+            r#"{"method":"item/started","params":{"threadId":"child-1","item":{"id":"cmd-1","type":"commandExecution","command":"rg TODO"}}}"#,
+        );
+        match &child_tool.events[0] {
+            BusEvent::ToolStart {
+                parent_tool_use_id, ..
+            } => assert_eq!(parent_tool_use_id.as_deref(), Some("agent-1")),
+            event => panic!("expected nested ToolStart, got {event:?}"),
+        }
+
+        let child_completed = server.parse_line(
+            "r",
+            r#"{"method":"turn/completed","params":{"threadId":"child-1"}}"#,
+        );
+        assert!(child_completed.lifecycle.is_none());
+        let root_completed = server.parse_line(
+            "r",
+            r#"{"method":"turn/completed","params":{"threadId":"th-123"}}"#,
+        );
+        assert_eq!(
+            root_completed.lifecycle,
+            Some(LifecycleSignal::TurnCompleted)
+        );
+    }
+
+    #[test]
+    fn stable_subagent_activity_registers_child_thread() {
+        let mut server = ready_server();
+        let started = server.parse_line(
+            "r",
+            r#"{"method":"item/started","params":{"threadId":"th-123","item":{"type":"subAgentActivity","id":"agent-1","kind":"started","agentThreadId":"child-1","agentPath":"/root/explorer"}}}"#,
+        );
+
+        match &started.events[0] {
+            BusEvent::ToolStart {
+                tool_name, input, ..
+            } => {
+                assert_eq!(tool_name, "Agent");
+                assert_eq!(input["operation"], "spawnAgent");
+                assert_eq!(input["agentPath"], "/root/explorer");
+                assert_eq!(input["receiverThreadIds"][0], "child-1");
+            }
+            event => panic!("expected Agent ToolStart, got {event:?}"),
+        }
+        assert_eq!(started.outbound[0]["method"], "thread/read");
+        assert_eq!(started.outbound[0]["params"]["threadId"], "child-1");
+
+        let child_tool = server.parse_line(
+            "r",
+            r#"{"method":"item/started","params":{"threadId":"child-1","item":{"id":"cmd-1","type":"commandExecution","command":"pwd"}}}"#,
+        );
+        match &child_tool.events[0] {
+            BusEvent::ToolStart {
+                parent_tool_use_id, ..
+            } => assert_eq!(parent_tool_use_id.as_deref(), Some("agent-1")),
+            event => panic!("expected nested ToolStart, got {event:?}"),
+        }
+    }
+
+    #[test]
+    fn child_notification_before_spawn_registration_is_replayed_in_parent_card() {
+        let mut server = ready_server();
+        let early = server.parse_line(
+            "r",
+            r#"{"method":"item/started","params":{"threadId":"child-1","item":{"id":"cmd-1","type":"commandExecution","command":"pwd"}}}"#,
+        );
+        assert!(early.events.is_empty());
+        assert_eq!(server.deferred_thread_messages["child-1"].len(), 1);
+
+        let registered = server.parse_line(
+            "r",
+            r#"{"method":"item/started","params":{"threadId":"th-123","item":{"type":"subAgentActivity","id":"spawn-1","kind":"started","agentThreadId":"child-1","agentPath":"/root/explorer"}}}"#,
+        );
+
+        assert_eq!(registered.events.len(), 2);
+        match &registered.events[1] {
+            BusEvent::ToolStart {
+                tool_use_id,
+                parent_tool_use_id,
+                ..
+            } => {
+                assert_eq!(tool_use_id, "cmd-1");
+                assert_eq!(parent_tool_use_id.as_deref(), Some("spawn-1"));
+            }
+            event => panic!("expected replayed child ToolStart, got {event:?}"),
+        }
+        assert!(!server.deferred_thread_messages.contains_key("child-1"));
+    }
+
+    #[test]
+    fn child_approval_before_spawn_registration_is_replayed_without_early_rejection() {
+        let mut server = ready_server();
+        let early = server.parse_line(
+            "r",
+            r#"{"id":77,"method":"item/commandExecution/requestApproval","params":{"threadId":"child-1","turnId":"child-turn","itemId":"cmd-1","startedAtMs":1,"command":"touch file"}}"#,
+        );
+        assert!(early.events.is_empty());
+        assert!(early.interactive.is_empty());
+        assert!(early.outbound.is_empty());
+        assert!(server.pending.is_empty());
+
+        let registered = server.parse_line(
+            "r",
+            r#"{"method":"item/started","params":{"threadId":"th-123","item":{"type":"subAgentActivity","id":"spawn-1","kind":"started","agentThreadId":"child-1","agentPath":"/root/explorer"}}}"#,
+        );
+
+        assert_eq!(registered.interactive.len(), 1);
+        assert_eq!(registered.interactive[0].request_id, "77");
+        assert!(server.pending.contains_key("77"));
+        match &registered.events[1] {
+            BusEvent::PermissionPrompt {
+                parent_tool_use_id, ..
+            } => assert_eq!(parent_tool_use_id.as_deref(), Some("spawn-1")),
+            event => panic!("expected replayed child PermissionPrompt, got {event:?}"),
+        }
+        assert!(registered
+            .outbound
+            .iter()
+            .all(|frame| frame.get("error").is_none()));
+    }
+
+    #[test]
+    fn unclaimed_thread_buffer_caps_distinct_threads() {
+        let mut server = ready_server();
+        for index in 0..=MAX_UNCLAIMED_THREADS {
+            let line = json!({
+                "method": "item/agentMessage/delta",
+                "params": {"threadId": format!("foreign-{index}"), "delta": "x"}
+            });
+            assert!(server.parse_line("r", &line.to_string()).events.is_empty());
+        }
+
+        assert_eq!(server.deferred_thread_messages.len(), MAX_UNCLAIMED_THREADS);
+        assert!(server
+            .deferred_thread_messages
+            .contains_key(&format!("foreign-{MAX_UNCLAIMED_THREADS}")));
+        assert!(!server.deferred_thread_messages.contains_key("foreign-0"));
+    }
+
+    #[test]
+    fn deferred_payload_budget_rejects_oversized_interactive_request() {
+        let mut server = ready_server();
+        let out = server.parse_line(
+            "r",
+            &json!({
+                "id": 99,
+                "method": M_FILE_APPROVAL,
+                "params": {
+                    "threadId": "child-oversized",
+                    "changes": "x".repeat(MAX_DEFERRED_PAYLOAD_BYTES)
+                }
+            })
+            .to_string(),
+        );
+
+        assert_eq!(out.outbound[0]["id"], 99);
+        assert_eq!(out.outbound[0]["error"]["code"], -32600);
+        assert!(server.deferred_thread_messages.is_empty());
+        assert_eq!(server.deferred_payload_bytes, 0);
+    }
+
+    #[test]
+    fn expired_deferred_interactive_request_receives_error_and_frees_capacity() {
+        let mut server = ready_server();
+        server.parse_line(
+            "r",
+            r#"{"id":77,"method":"item/commandExecution/requestApproval","params":{"threadId":"child-old","command":"pwd"}}"#,
+        );
+        server
+            .deferred_thread_messages
+            .get_mut("child-old")
+            .unwrap()[0]
+            .received_at = Instant::now() - DEFERRED_MESSAGE_TTL - Duration::from_secs(1);
+
+        let out = server.parse_line(
+            "r",
+            r#"{"method":"item/agentMessage/delta","params":{"threadId":"child-new","delta":"x"}}"#,
+        );
+
+        assert_eq!(out.outbound[0]["id"], 77);
+        assert_eq!(
+            out.outbound[0]["error"]["message"],
+            "Interactive request expired"
+        );
+        assert!(!server.deferred_thread_messages.contains_key("child-old"));
+        assert!(server.deferred_thread_messages.contains_key("child-new"));
+    }
+
+    #[test]
+    fn expired_interactive_is_rejected_instead_of_replayed_on_registration() {
+        let mut server = ready_server();
+        server.parse_line(
+            "r",
+            r#"{"id":78,"method":"item/commandExecution/requestApproval","params":{"threadId":"child-old","command":"pwd"}}"#,
+        );
+        server
+            .deferred_thread_messages
+            .get_mut("child-old")
+            .unwrap()[0]
+            .received_at = Instant::now() - DEFERRED_MESSAGE_TTL - Duration::from_secs(1);
+
+        let registered = server.parse_line(
+            "r",
+            r#"{"method":"item/started","params":{"threadId":"th-123","item":{"type":"subAgentActivity","id":"spawn-1","kind":"started","agentThreadId":"child-old"}}}"#,
+        );
+
+        assert!(registered.interactive.is_empty());
+        assert!(!server.pending.contains_key("78"));
+        assert_eq!(registered.outbound[0]["id"], 78);
+        assert_eq!(
+            registered.outbound[0]["error"]["message"],
+            "Interactive request expired"
+        );
+    }
+
+    #[test]
+    fn spawned_thread_lookup_is_deduplicated() {
+        let mut server = ready_server();
+        let line = r#"{"method":"item/completed","params":{"item":{"id":"agent-1","type":"collabAgentToolCall","tool":"spawnAgent","receiverThreadIds":["child-1"]}}}"#;
+        assert_eq!(server.parse_line("r", line).outbound.len(), 1);
+        assert!(server.parse_line("r", line).outbound.is_empty());
+    }
+
+    #[test]
+    fn wait_agent_does_not_reparent_spawned_thread() {
+        let mut server = ready_server();
+        server.parse_line(
+            "r",
+            r#"{"method":"item/started","params":{"threadId":"th-123","item":{"type":"subAgentActivity","id":"spawn-1","kind":"started","agentThreadId":"child-1","agentPath":"/root/explorer"}}}"#,
+        );
+
+        let wait = server.parse_line(
+            "r",
+            r#"{"method":"item/started","params":{"threadId":"th-123","item":{"id":"wait-1","type":"collabAgentToolCall","tool":"wait","receiverThreadIds":["child-1"]}}}"#,
+        );
+        assert!(wait.outbound.is_empty());
+
+        let child_tool = server.parse_line(
+            "r",
+            r#"{"method":"item/started","params":{"threadId":"child-1","item":{"id":"cmd-1","type":"commandExecution","command":"pwd"}}}"#,
+        );
+        match &child_tool.events[0] {
+            BusEvent::ToolStart {
+                parent_tool_use_id, ..
+            } => assert_eq!(parent_tool_use_id.as_deref(), Some("spawn-1")),
+            event => panic!("expected nested ToolStart, got {event:?}"),
+        }
+    }
+
+    #[test]
+    fn later_subagent_activity_does_not_reparent_spawned_thread() {
+        let mut server = ready_server();
+        server.parse_line(
+            "r",
+            r#"{"method":"item/started","params":{"threadId":"th-123","item":{"type":"subAgentActivity","id":"spawn-1","kind":"started","agentThreadId":"child-1","agentPath":"/root/explorer"}}}"#,
+        );
+
+        let interacted = server.parse_line(
+            "r",
+            r#"{"method":"item/started","params":{"threadId":"th-123","item":{"type":"subAgentActivity","id":"interaction-1","kind":"interacted","agentThreadId":"child-1","agentPath":"/root/explorer"}}}"#,
+        );
+        assert!(interacted.outbound.is_empty());
+        match &interacted.events[0] {
+            BusEvent::ToolStart { input, .. } => {
+                assert_eq!(input["operation"], "interacted");
+                assert_eq!(input["activityKind"], "interacted");
+                assert_eq!(input["status"], "inProgress");
+            }
+            event => panic!("expected interaction ToolStart, got {event:?}"),
+        }
+
+        let child_tool = server.parse_line(
+            "r",
+            r#"{"method":"item/started","params":{"threadId":"child-1","item":{"id":"cmd-1","type":"commandExecution","command":"pwd"}}}"#,
+        );
+        match &child_tool.events[0] {
+            BusEvent::ToolStart {
+                parent_tool_use_id, ..
+            } => assert_eq!(parent_tool_use_id.as_deref(), Some("spawn-1")),
+            event => panic!("expected nested ToolStart, got {event:?}"),
+        }
+    }
+
+    #[test]
+    fn interrupted_subagent_activity_maps_to_terminal_error() {
+        let mut server = ready_server();
+        let completed = server.parse_line(
+            "r",
+            r#"{"method":"item/completed","params":{"threadId":"th-123","item":{"type":"subAgentActivity","id":"interrupt-1","kind":"interrupted","agentThreadId":"child-1","agentPath":"/root/explorer"}}}"#,
+        );
+
+        match &completed.events[0] {
+            BusEvent::ToolEnd {
+                status,
+                tool_use_result,
+                ..
+            } => {
+                assert_eq!(status, "error");
+                let result = tool_use_result.as_ref().unwrap();
+                assert_eq!(result["operation"], "interrupted");
+                assert_eq!(result["activityKind"], "interrupted");
+                assert_eq!(result["status"], "interrupted");
+                assert_eq!(result["agents"][0]["status"], "interrupted");
+            }
+            event => panic!("expected interrupted ToolEnd, got {event:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_spawn_stays_in_top_level_agent_card() {
+        let mut server = ready_server();
+        server.parse_line(
+            "r",
+            r#"{"method":"item/started","params":{"threadId":"th-123","item":{"type":"subAgentActivity","id":"spawn-1","kind":"started","agentThreadId":"child-1","agentPath":"/root/explorer"}}}"#,
+        );
+        let nested = server.parse_line(
+            "r",
+            r#"{"method":"item/started","params":{"threadId":"child-1","item":{"type":"subAgentActivity","id":"spawn-2","kind":"started","agentThreadId":"grandchild-1","agentPath":"/root/explorer/worker"}}}"#,
+        );
+        assert_eq!(nested.outbound[0]["params"]["threadId"], "grandchild-1");
+
+        let grandchild_tool = server.parse_line(
+            "r",
+            r#"{"method":"item/started","params":{"threadId":"grandchild-1","item":{"id":"cmd-1","type":"commandExecution","command":"pwd"}}}"#,
+        );
+        match &grandchild_tool.events[0] {
+            BusEvent::ToolStart {
+                parent_tool_use_id, ..
+            } => assert_eq!(parent_tool_use_id.as_deref(), Some("spawn-1")),
+            event => panic!("expected nested ToolStart, got {event:?}"),
+        }
+    }
+
+    #[test]
+    fn child_state_notifications_do_not_mutate_parent_state() {
+        let mut server = ready_server();
+        server.parse_line(
+            "r",
+            r#"{"method":"item/started","params":{"threadId":"th-123","item":{"type":"subAgentActivity","id":"spawn-1","kind":"started","agentThreadId":"child-1","agentPath":"/root/explorer"}}}"#,
+        );
+
+        for line in [
+            r#"{"method":"thread/goal/updated","params":{"threadId":"child-1","goal":{"objective":"child"}}}"#,
+            r#"{"method":"turn/plan/updated","params":{"threadId":"child-1","turnId":"child-turn","plan":[]}}"#,
+            r#"{"method":"turn/diff/updated","params":{"threadId":"child-1","turnId":"child-turn","diff":"child diff"}}"#,
+            r#"{"method":"account/rateLimits/updated","params":{"threadId":"child-1","rateLimits":{}}}"#,
+        ] {
+            assert!(server.parse_line("r", line).events.is_empty());
+        }
+    }
+
+    #[test]
+    fn child_interactive_request_is_nested_in_agent_card() {
+        let mut server = ready_server();
+        server.parse_line(
+            "r",
+            r#"{"method":"item/started","params":{"threadId":"th-123","item":{"type":"subAgentActivity","id":"spawn-1","kind":"started","agentThreadId":"child-1","agentPath":"/root/explorer"}}}"#,
+        );
+
+        let request = server.parse_line(
+            "r",
+            r#"{"id":77,"method":"item/commandExecution/requestApproval","params":{"threadId":"child-1","turnId":"child-turn","itemId":"cmd-1","startedAtMs":1,"command":"touch file"}}"#,
+        );
+        match &request.events[0] {
+            BusEvent::PermissionPrompt {
+                parent_tool_use_id, ..
+            } => assert_eq!(parent_tool_use_id.as_deref(), Some("spawn-1")),
+            event => panic!("expected nested PermissionPrompt, got {event:?}"),
+        }
+    }
+
+    #[test]
+    fn unrelated_thread_notifications_do_not_mutate_the_run() {
+        let mut server = ready_server();
+        let foreign_tool = server.parse_line(
+            "r",
+            r#"{"method":"item/started","params":{"threadId":"another-thread","item":{"id":"cmd-1","type":"commandExecution","command":"pwd"}}}"#,
+        );
+        assert!(foreign_tool.events.is_empty());
+
+        let foreign_turn = server.parse_line(
+            "r",
+            r#"{"method":"turn/completed","params":{"threadId":"another-thread"}}"#,
+        );
+        assert!(foreign_turn.lifecycle.is_none());
+    }
+
+    #[test]
+    fn codex_agent_info_serializes_as_bus_contract() {
+        let event = BusEvent::CodexAgentInfo {
+            run_id: "r".into(),
+            thread_id: "child-1".into(),
+            nickname: Some("Dewey".into()),
+            role: None,
+            parent_thread_id: Some("root".into()),
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["type"], "codex_agent_info");
+        assert_eq!(value["thread_id"], "child-1");
+        assert!(value.get("role").is_none());
+        assert!(crate::agent::claude_protocol::validate_bus_event(&event).is_none());
     }
 
     #[test]
@@ -2498,7 +3772,7 @@ mod tests {
         // Terminal error: message is nested under `error.message` (TurnError), surfaced.
         let out = s.parse_line(
             "r",
-            r#"{"method":"error","params":{"error":{"message":"model overloaded"},"willRetry":false,"threadId":"t","turnId":"u"}}"#,
+            r#"{"method":"error","params":{"error":{"message":"model overloaded"},"willRetry":false,"threadId":"th-123","turnId":"u"}}"#,
         );
         match &out.events[0] {
             BusEvent::CommandOutput { content, .. } => {
@@ -2509,7 +3783,7 @@ mod tests {
         // Transient error (willRetry): Codex auto-retries → no user-facing event.
         let out = s.parse_line(
             "r",
-            r#"{"method":"error","params":{"error":{"message":"tls handshake eof"},"willRetry":true,"threadId":"t","turnId":"u"}}"#,
+            r#"{"method":"error","params":{"error":{"message":"tls handshake eof"},"willRetry":true,"threadId":"th-123","turnId":"u"}}"#,
         );
         assert!(
             out.events.is_empty(),
@@ -2557,7 +3831,7 @@ mod tests {
         let mut s = ready_server();
         let out = s.parse_line(
             "r",
-            r#"{"method":"guardianWarning","params":{"threadId":"t","message":"high-risk action detected"}}"#,
+            r#"{"method":"guardianWarning","params":{"threadId":"th-123","message":"high-risk action detected"}}"#,
         );
         match &out.events[0] {
             BusEvent::CommandOutput { content, .. } => {
@@ -2567,7 +3841,7 @@ mod tests {
         }
         let out = s.parse_line(
             "r",
-            r#"{"method":"model/verification","params":{"threadId":"t","turnId":"u","verifications":["trustedAccessForCyber"]}}"#,
+            r#"{"method":"model/verification","params":{"threadId":"th-123","turnId":"u","verifications":["trustedAccessForCyber"]}}"#,
         );
         match &out.events[0] {
             BusEvent::CommandOutput { content, .. } => {
@@ -2581,7 +3855,7 @@ mod tests {
         // Empty verifications → no event.
         let out = s.parse_line(
             "r",
-            r#"{"method":"model/verification","params":{"threadId":"t","turnId":"u","verifications":[]}}"#,
+            r#"{"method":"model/verification","params":{"threadId":"th-123","turnId":"u","verifications":[]}}"#,
         );
         assert!(out.events.is_empty());
     }
@@ -2611,7 +3885,7 @@ mod tests {
         let mut s = ready_server();
         let out = s.parse_line(
             "r",
-            r#"{"method":"turn/diff/updated","params":{"threadId":"t","turnId":"tu","diff":"--- a\n+++ b\n@@ -1 +1 @@\n-old\n+new"}}"#,
+            r#"{"method":"turn/diff/updated","params":{"threadId":"th-123","turnId":"tu","diff":"--- a\n+++ b\n@@ -1 +1 @@\n-old\n+new"}}"#,
         );
         assert_eq!(out.events.len(), 1);
         match &out.events[0] {
@@ -2653,11 +3927,47 @@ mod tests {
     }
 
     #[test]
+    fn root_notification_before_start_ack_is_replayed_after_ownership_is_known() {
+        let mut server = CodexAppServer::new();
+        let early = server.parse_line(
+            "r",
+            r#"{"method":"item/agentMessage/delta","params":{"threadId":"root-1","delta":"hello"}}"#,
+        );
+        assert!(early.events.is_empty());
+
+        let ack = server.parse_line(
+            "r",
+            r#"{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"root-1"}}}"#,
+        );
+        assert_eq!(ack.thread_id.as_deref(), Some("root-1"));
+        match &ack.events[0] {
+            BusEvent::MessageDelta {
+                text,
+                parent_tool_use_id,
+                ..
+            } => {
+                assert_eq!(text, "hello");
+                assert!(parent_tool_use_id.is_none());
+            }
+            event => panic!("expected replayed root MessageDelta, got {event:?}"),
+        }
+    }
+
+    #[test]
     fn interrupt_after_ready() {
         let mut s = ready_server();
+        assert!(
+            s.frame_interrupt().is_empty(),
+            "ready thread with no active turn must not send an invalid interrupt"
+        );
+        s.parse_line(
+            "r",
+            r#"{"method":"turn/started","params":{"turn":{"id":"turn-123"}}}"#,
+        );
         let msgs = s.frame_interrupt();
         assert_eq!(msgs[0]["method"], "turn/interrupt");
         assert_eq!(msgs[0]["params"]["threadId"], "th-123");
+        assert_eq!(msgs[0]["params"]["turnId"], "turn-123");
     }
 
     // ── Wave-3: data-returning frame methods + response correlation ──────────────────────
@@ -2905,15 +4215,18 @@ mod tests {
                         }
                         stdin.flush().await.unwrap();
                     }
-                    if let Some(pi) = &parsed.interactive {
+                    for pi in &parsed.interactive {
                         if pi.kind == PendingKind::Permission {
                             saw_approval = true;
                             assert!(matches!(parsed.events[0], BusEvent::PermissionPrompt { .. }));
-                            for msg in driver.frame_response(
-                                PendingKind::Permission,
-                                &pi.request_id,
-                                serde_json::json!({"behavior": "allow"}),
-                            ) {
+                            for msg in driver
+                                .frame_response(
+                                    PendingKind::Permission,
+                                    &pi.request_id,
+                                    serde_json::json!({"behavior": "allow"}),
+                                )
+                                .unwrap()
+                            {
                                 let mut l = serde_json::to_string(&msg).unwrap();
                                 l.push('\n');
                                 stdin.write_all(l.as_bytes()).await.unwrap();
@@ -3008,7 +4321,7 @@ mod tests {
                         stdin.flush().await.unwrap();
                     }
 
-                    if let Some(pi) = &parsed.interactive {
+                    for pi in &parsed.interactive {
                         if pi.kind == PendingKind::UserInput {
                             saw_user_input = true;
                             // Pull qid + first option label out of the AskUserQuestion ToolStart.
@@ -3026,7 +4339,10 @@ mod tests {
                                 })
                                 .expect("questions in AskUserQuestion event");
                             let answers = serde_json::json!({ "answers": { qid: [label] } });
-                            for msg in driver.frame_response(PendingKind::UserInput, &pi.request_id, answers) {
+                            for msg in driver
+                                .frame_response(PendingKind::UserInput, &pi.request_id, answers)
+                                .unwrap()
+                            {
                                 let mut l = serde_json::to_string(&msg).unwrap();
                                 l.push('\n');
                                 stdin.write_all(l.as_bytes()).await.unwrap();

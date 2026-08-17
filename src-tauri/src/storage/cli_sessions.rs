@@ -1034,12 +1034,10 @@ fn extract_summary(
         }
     }
 
-    // If cwd doesn't match target, skip (empty or "/" means show all).
-    // Compare normalized so a JSONL's native path (e.g. `C:\Users\a\Work`)
-    // matches the frontend-normalized target (`C:/Users/a/Work`) on Windows.
+    // If cwd doesn't match target, skip (empty or "/" means show all)
     let show_all = target_cwd.is_empty() || target_cwd == "/";
     let matched_cwd = match &cwd {
-        Some(c) if show_all || normalize_cwd(c) == normalize_cwd(target_cwd) => c.clone(),
+        Some(c) if show_all || c == target_cwd => c.clone(),
         _ => return Ok(None),
     };
 
@@ -1695,15 +1693,14 @@ mod tests {
         assert_eq!(encode_cwd("/Users/alice/project"), "-Users-alice-project");
         assert_eq!(encode_cwd("/"), "-");
         assert_eq!(encode_cwd("relative"), "relative");
-        // Windows paths: the drive colon collapses to '-' too, matching Claude's
-        // on-disk project dir `~/.claude/projects/C--Users-alice-project/`.
+        // Windows paths
         assert_eq!(
             encode_cwd("C:\\Users\\alice\\project"),
-            "C--Users-alice-project"
+            "C:-Users-alice-project"
         );
         assert_eq!(
             encode_cwd("C:/Users/alice/project"),
-            "C--Users-alice-project"
+            "C:-Users-alice-project"
         );
     }
 

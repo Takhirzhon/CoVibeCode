@@ -1,5 +1,11 @@
 <script lang="ts">
-  import type { BusToolItem, TimelineEntry, PermissionSuggestion } from "$lib/types";
+  import type {
+    BusToolItem,
+    TimelineEntry,
+    PermissionSuggestion,
+    CodexAgentIdentity,
+    HistoryContent,
+  } from "$lib/types";
   import type { TaskNotificationItem } from "$lib/stores/session-store.svelte";
   import { getToolColor } from "$lib/utils/tool-colors";
   import {
@@ -18,20 +24,24 @@
     shouldShowSubTimeline as _shouldShow,
     getToolRenderLevel,
     getToolDetail,
+    getPermissionProfileDetails,
     isToolTerminal,
     formatSuggestionLabel as _fmtSuggestion,
+    singleCodexReceiverThreadId,
   } from "$lib/utils/tool-rendering";
   import MarkdownContent from "$lib/components/MarkdownContent.svelte";
   import ToolDetailView from "$lib/components/ToolDetailView.svelte";
   import StatusIcon from "$lib/components/StatusIcon.svelte";
   import { t } from "$lib/i18n/index.svelte";
   import { dbg } from "$lib/utils/debug";
+  import HistoryContentPager from "$lib/components/HistoryContentPager.svelte";
+  import { isCurrentSubhistoryPage } from "$lib/utils/history-request-guard";
+  import * as api from "$lib/api";
 
   let {
     tool,
     subTimeline,
     runId,
-    fetchToolResult,
     onAnswer,
     onApprove,
     onPermissionRespond,
@@ -40,16 +50,15 @@
     planContent,
     latestPlanTool,
     showPermissionInPanel,
+    codexAgentInfo,
     agentDisplayName,
     onPreviewFile,
+    historyGenerationId,
   }: {
     tool: BusToolItem;
     subTimeline?: TimelineEntry[];
-    /** Run ID for lazy-loading truncated tool results. */
     runId?: string;
-    /** Callback to fetch full tool result from backend (with caching). */
-    fetchToolResult?: (runId: string, toolUseId: string) => Promise<Record<string, unknown> | null>;
-    onAnswer?: (answer: string) => void;
+    onAnswer?: (answer: string) => void | Promise<void>;
     onApprove?: (toolName: string) => void;
     /** Inline permission response (--permission-prompt-tool stdio). */
     onPermissionRespond?: (
@@ -70,11 +79,20 @@
     latestPlanTool?: boolean;
     /** Whether generic tool permissions are handled by the floating PermissionPanel. */
     showPermissionInPanel?: boolean;
+    /** Spawned Codex thread identity keyed by thread id. */
+    codexAgentInfo?: Record<string, CodexAgentIdentity>;
     /** Display name for the agent (e.g. "Claude" or "Codex"). */
     agentDisplayName?: string;
     /** Click on Edit/Write/Read tool card's file path → open preview in right panel. */
     onPreviewFile?: (path: string) => void;
+    historyGenerationId?: string;
   } = $props();
+
+  let historyContents = $derived(
+    tool._historyContent as
+      | { input?: HistoryContent; output?: HistoryContent; result?: HistoryContent }
+      | undefined,
+  );
 
   // Look up the task notification for this specific Task tool
   let taskNotification = $derived.by(() => {
@@ -88,49 +106,31 @@
   let userExpanded = $state<boolean | null>(null);
   let submitting = $state(false);
 
-  // ── Lazy loading for truncated tool results ──
-  let lazyResult = $state<Record<string, unknown> | null>(null);
-  let lazyLoading = $state(false);
-  let lazyFailed = $state(false);
-  let lazyReqId = 0; // request generation marker
+  let historySubTimeline = $state<TimelineEntry[]>([]);
+  let historySubCursor = $state<string | undefined>(undefined);
+  let historySubHasMore = $state(false);
+  let historySubLoading = $state(false);
+  let historySubLoaded = $state(false);
+  let historySubError = $state("");
+  let historySubRequestGeneration = 0;
 
   let isTruncated = $derived(
     (tool.tool_use_result as Record<string, unknown> | undefined)?._truncated === true,
   );
+  let subHistoryId = $derived(tool._subHistoryId as string | undefined);
 
-  // Merge lazy-loaded result into tool for rendering
-  let enrichedTool = $derived.by(() => {
-    if (!lazyResult) return tool;
-    return { ...tool, tool_use_result: lazyResult };
-  });
-
-  // Auto-fetch full result when expanded + truncated
-  // Guard: Level 2 auto-expand does NOT auto-fetch truncated results to avoid
-  // a fetch storm on history load. User must click "Load full output" first.
   $effect(() => {
-    if (!expanded || !isTruncated || lazyResult || lazyLoading || lazyFailed) return;
-    if (!runId || !fetchToolResult) return;
-    if (userExpanded === null && isTruncated) return;
-    const reqId = ++lazyReqId;
-    lazyLoading = true;
-    fetchToolResult(runId, tool.tool_use_id)
-      .then((r) => {
-        if (reqId !== lazyReqId) return; // stale — component switched/collapsed
-        lazyResult = r;
-        if (!r) lazyFailed = true; // not found → terminal state
-      })
-      .catch(() => {
-        if (reqId !== lazyReqId) return;
-        lazyFailed = true;
-      })
-      .finally(() => {
-        if (reqId === lazyReqId) lazyLoading = false;
-      });
+    const identity = `${runId}:${historyGenerationId ?? ""}:${subHistoryId ?? ""}`;
+    void identity;
+    historySubRequestGeneration++;
+    historySubTimeline = [];
+    historySubCursor = undefined;
+    historySubHasMore = false;
+    historySubLoading = false;
+    historySubLoaded = false;
+    historySubError = "";
   });
 
-  function retryLazyLoad() {
-    lazyFailed = false; // reset — effect will re-trigger
-  }
   let multiChecked: Record<string, boolean> = $state({});
   // Per-question answers for multi-question AskUserQuestion
   let questionAnswers: Record<string, string> = $state({});
@@ -165,7 +165,10 @@
     userExpanded ?? (renderLevel === 2 || (isPlan && latestPlanTool) || isInputStreaming),
   );
 
-  let hasSubTimeline = $derived((subTimeline?.length ?? 0) > 0);
+  let effectiveSubTimeline = $derived(
+    historySubTimeline.length > 0 ? historySubTimeline : subTimeline,
+  );
+  let hasSubTimeline = $derived((effectiveSubTimeline?.length ?? 0) > 0 || !!subHistoryId);
 
   // SubTimeline visibility: all tools auto-collapse on terminal state, userExpanded overrides
   let showSubTimeline = $derived.by(() => {
@@ -182,6 +185,117 @@
       toolName: tool.tool_name,
       renderLevel,
     });
+    if (willExpand && subHistoryId && !historySubLoaded) void loadSubhistory();
+  }
+
+  function mapSubEntry(entry: import("$lib/types").HistoryEntry): TimelineEntry {
+    if (entry.kind === "assistant") {
+      return {
+        kind: "assistant",
+        id: entry.id,
+        anchorId: entry.anchorId,
+        content: entry.content.preview,
+        thinkingText: entry.thinking?.preview,
+        ts: entry.ts,
+        historyContent: entry.content.truncated ? entry.content : undefined,
+        thinkingHistoryContent: entry.thinking?.truncated ? entry.thinking : undefined,
+      };
+    }
+    if (entry.kind === "user") {
+      return {
+        kind: "user",
+        id: entry.id,
+        anchorId: entry.anchorId,
+        content: entry.content.preview,
+        ts: entry.ts,
+      };
+    }
+    if (entry.kind === "tool") {
+      return {
+        kind: "tool",
+        id: entry.id,
+        anchorId: entry.anchorId,
+        ts: entry.ts,
+        tool: {
+          tool_use_id: entry.toolUseId,
+          tool_name: entry.toolName,
+          input: entry.input,
+          output: entry.output ?? undefined,
+          status: entry.status,
+          duration_ms: entry.durationMs,
+          tool_use_result: entry.toolUseResult,
+          _historyContent: {
+            input: entry.inputContent,
+            output: entry.outputContent,
+            result: entry.resultContent,
+          },
+          _subHistoryId: entry.subHistoryId,
+        },
+      };
+    }
+    return {
+      kind: "command_output",
+      id: entry.id,
+      anchorId: entry.anchorId,
+      content: entry.content.preview,
+      ts: entry.ts,
+    };
+  }
+
+  async function loadSubhistory() {
+    if (!runId || !historyGenerationId || !subHistoryId || historySubLoading) return;
+    const request = {
+      token: ++historySubRequestGeneration,
+      runId,
+      generationId: historyGenerationId,
+      subHistoryId,
+    };
+    const requestedCursor = historySubCursor;
+    historySubLoading = true;
+    historySubError = "";
+    try {
+      const page = await api.getSubhistoryPage(
+        request.runId,
+        request.generationId,
+        request.subHistoryId,
+        requestedCursor,
+      );
+      const current = {
+        runId: runId ?? "",
+        generationId: historyGenerationId ?? "",
+        subHistoryId: subHistoryId ?? "",
+      };
+      if (!isCurrentSubhistoryPage(request, historySubRequestGeneration, page, current)) {
+        return;
+      }
+      historySubTimeline = [...page.entries.map(mapSubEntry), ...historySubTimeline];
+      historySubCursor = page.pageCursor;
+      historySubHasMore = page.hasMore;
+      historySubLoaded = true;
+      dbg("history", "subhistory page loaded", {
+        subHistoryId,
+        entries: page.entries.length,
+        hasMore: page.hasMore,
+      });
+    } catch (error) {
+      if (
+        request.token === historySubRequestGeneration &&
+        request.runId === runId &&
+        request.generationId === historyGenerationId &&
+        request.subHistoryId === subHistoryId
+      ) {
+        historySubError = String(error);
+        dbg("history", "subhistory page failed", { subHistoryId, error: historySubError });
+      }
+    } finally {
+      if (
+        request.token === historySubRequestGeneration &&
+        request.runId === runId &&
+        request.generationId === historyGenerationId &&
+        request.subHistoryId === subHistoryId
+      )
+        historySubLoading = false;
+    }
   }
 
   let subToolCount = $derived.by(() => {
@@ -204,6 +318,12 @@
 
   // Extract a human-readable detail from tool input (file path, command, pattern, etc.)
   let detail = $derived(getToolDetail(tool.input));
+  let permissionDetails = $derived(
+    getPermissionProfileDetails(
+      tool.input,
+      t as (key: string, params?: Record<string, string>) => string,
+    ),
+  );
 
   let planLabel = $derived(planFileName(detail));
   let displayDetail = $derived(planLabel ? t("inline_planLabel", { name: planLabel }) : detail);
@@ -236,12 +356,25 @@
     if (res?.codexCollab && typeof res.operation === "string") return res.operation;
     return null;
   });
+  let codexAgentThreadId = $derived.by<string | null>(() => {
+    if (!codexCollabOp) return null;
+    const inp = tool.input as Record<string, unknown> | undefined;
+    const res = tool.tool_use_result as Record<string, unknown> | undefined;
+    return singleCodexReceiverThreadId(inp, res);
+  });
+  let codexIdentity = $derived(
+    codexAgentThreadId ? codexAgentInfo?.[codexAgentThreadId] : undefined,
+  );
 
   // Status display
   let statusKind = $derived(
     tool.status === "success"
       ? "done"
-      : tool.status === "error" || tool.status === "denied" || tool.status === "permission_denied"
+      : tool.status === "error" ||
+          tool.status === "response_failed" ||
+          tool.status === "denied" ||
+          tool.status === "permission_denied" ||
+          tool.status === "rejected"
         ? "error"
         : tool.status === "permission_prompt"
           ? "permission_prompt"
@@ -255,7 +388,7 @@
     if (!isAsk) return false;
     if (tool.status === "permission_denied") return true;
     // Fallback: error status + no option selected = denied/interrupted
-    if (tool.status === "error") {
+    if (tool.status === "error" || tool.status === "response_failed") {
       const opts = parsedQuestions[0]?.options.map((o) => o.label) ?? [];
       const ansText = extractOutputText(tool.output);
       const ansSet = new Set(
@@ -500,7 +633,7 @@
     if (submitting) return;
     submitting = true;
     try {
-      onAnswer?.(answer);
+      await onAnswer?.(answer);
     } catch {
       submitting = false;
     }
@@ -539,7 +672,7 @@
   // Multi-question submit for the ask_pending (onAnswer) path — used by Codex app-server
   // (and Claude pipe mode) where the answer goes back via onAnswer, not a permission response.
   // Encodes all answers keyed by both question id (for Codex respond_user_input) and text.
-  function submitAllAskAnswers() {
+  async function submitAllAskAnswers() {
     if (submitting || !onAnswer || !allQuestionsAnswered) return;
     submitting = true;
     const byId: Record<string, string> = {};
@@ -549,7 +682,11 @@
       byText[q.question] = ans;
       if (q.id) byId[q.id] = ans;
     }
-    onAnswer(JSON.stringify({ __askMulti: true, byId, byText }));
+    try {
+      await onAnswer(JSON.stringify({ __askMulti: true, byId, byText }));
+    } catch {
+      submitting = false;
+    }
   }
 
   // Multi-question: submit all answers at once
@@ -818,7 +955,17 @@
               </svg>
             </div>
             <span class="text-xs font-medium text-muted-foreground">{t("inline_question")}</span>
-            {#if isAskDenied}
+            {#if tool.status === "response_pending"}
+              <span
+                class="ml-auto rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[10px] font-medium text-amber-500"
+                >{t("interaction_responsePending")}</span
+              >
+            {:else if tool.status === "response_failed"}
+              <span
+                class="ml-auto rounded-full border border-red-500/30 bg-red-500/10 px-2 py-0.5 text-[10px] font-medium text-red-500"
+                >{t("interaction_responseFailed")}</span
+              >
+            {:else if isAskDenied}
               <span
                 class="ml-auto rounded-full border border-red-500/30 bg-red-500/10 px-2 py-0.5 text-[10px] font-medium text-red-500"
                 >{t("common_denied")}</span
@@ -1516,9 +1663,20 @@
             {t("inline_agentWantsToUse", { agent: agentDisplayName ?? "Claude" })}
             <strong>{tool.tool_name}</strong>
           </p>
-          {#if detail}
+          {#if tool.permission_reason}
+            <p class="mb-2 whitespace-pre-wrap break-words text-xs text-foreground/80">
+              {t("perm_requestReason", { reason: tool.permission_reason })}
+            </p>
+          {/if}
+          {#if permissionDetails.length > 0}
+            <ul class="mb-2 space-y-1 text-xs text-muted-foreground">
+              {#each permissionDetails as permissionDetail}
+                <li class="whitespace-pre-wrap break-all">• {permissionDetail}</li>
+              {/each}
+            </ul>
+          {:else if detail}
             <p
-              class="text-xs text-muted-foreground mb-2 truncate"
+              class="text-xs text-muted-foreground mb-2 whitespace-pre-wrap break-all"
               style:direction={isPathLikeDetail ? "rtl" : undefined}
               style:text-align={isPathLikeDetail ? "left" : undefined}
             >
@@ -1625,7 +1783,12 @@
       <div class="flex-1 min-w-0 flex items-center gap-1.5">
         {#if codexCollabOp}
           <!-- Codex collab subagent: "Sub-agent · {operation}" -->
-          <span class="text-xs font-medium text-foreground">{t("inline_subagent")}</span>
+          <span class="text-xs font-medium text-foreground"
+            >{codexIdentity?.nickname ?? t("inline_subagent")}</span
+          >
+          {#if codexIdentity?.role}
+            <span class="text-[10px] text-cyan-500/80">{codexIdentity.role}</span>
+          {/if}
           <span class="text-xs text-muted-foreground">· {codexCollabOp}</span>
           {#if subToolCount > 0}
             <span class="text-[10px] px-1 py-0.5 rounded bg-muted text-muted-foreground">
@@ -1778,31 +1941,38 @@
     <!-- Expanded content area with accent left border -->
     {#if expanded}
       <div class="ml-2.5 pl-2 border-l-2 {renderLevel === 2 ? style.border : 'border-border/20'}">
-        {#if isTruncated && !lazyResult}
-          {#if lazyLoading}
-            <div class="px-4 py-3 text-center text-xs text-muted-foreground animate-pulse">
-              Loading tool details...
-            </div>
-          {:else if lazyFailed}
-            <div class="px-4 py-3 text-center text-xs text-muted-foreground">
-              Failed to load details
-              <button class="ml-2 underline hover:text-foreground" onclick={retryLazyLoad}
-                >Retry</button
-              >
-            </div>
-          {:else}
-            <!-- Auto-expanded but not yet fetched (truncated) -->
-            <button
-              class="w-full text-xs text-muted-foreground/60 hover:text-muted-foreground py-2 transition-colors"
-              onclick={() => {
-                userExpanded = true;
-              }}
-            >
-              {t("inline_loadDetails")}
-            </button>
-          {/if}
+        {#if isTruncated && !historyContents}
+          <div class="px-4 py-3 text-center text-xs text-muted-foreground">
+            {t("historyContent_unavailable")}
+          </div>
         {:else}
-          <ToolDetailView tool={enrichedTool} {isInputStreaming} {onPreviewFile} />
+          <ToolDetailView {tool} {isInputStreaming} {onPreviewFile} {codexAgentInfo} />
+        {/if}
+        {#if historyContents && runId && historyGenerationId}
+          {#if historyContents.input}
+            <HistoryContentPager
+              {runId}
+              generationId={historyGenerationId}
+              content={historyContents.input}
+              label={t("historyContent_toolInput")}
+            />
+          {/if}
+          {#if historyContents.output}
+            <HistoryContentPager
+              {runId}
+              generationId={historyGenerationId}
+              content={historyContents.output}
+              label={t("historyContent_toolOutput")}
+            />
+          {/if}
+          {#if historyContents.result}
+            <HistoryContentPager
+              {runId}
+              generationId={historyGenerationId}
+              content={historyContents.result}
+              label={t("historyContent_toolResult")}
+            />
+          {/if}
         {/if}
       </div>
     {/if}
@@ -1835,7 +2005,20 @@
   <!-- Subagent subTimeline: nested entries from child agents -->
   {#if showSubTimeline}
     <div class="mt-2 ml-4 pl-3 border-l-2 border-blue-500/30 space-y-1">
-      {#each subTimeline as subEntry (subEntry.id)}
+      {#if historySubHasMore}
+        <button
+          class="text-xs text-muted-foreground underline disabled:opacity-50"
+          disabled={historySubLoading}
+          onclick={loadSubhistory}
+          >{historySubLoading ? t("historyContent_loading") : t("historySub_loadEarlier")}</button
+        >
+      {/if}
+      {#if historySubError}
+        <button class="text-xs text-destructive underline" onclick={loadSubhistory}
+          >{t("historyContent_retry")}: {historySubError}</button
+        >
+      {/if}
+      {#each effectiveSubTimeline ?? [] as subEntry (subEntry.id)}
         {#if subEntry.kind === "assistant"}
           <div class="text-sm text-muted-foreground py-1">
             {#if subEntry.thinkingText}
@@ -1846,20 +2029,47 @@
               text={subEntry.content}
               streaming={subEntry.id?.startsWith("__sub_stream_") ?? false}
             />
+            {#if subEntry.historyContent && runId && historyGenerationId}
+              <HistoryContentPager
+                {runId}
+                generationId={historyGenerationId}
+                content={subEntry.historyContent}
+              />
+            {/if}
+            {#if subEntry.thinkingHistoryContent && runId && historyGenerationId}
+              <HistoryContentPager
+                {runId}
+                generationId={historyGenerationId}
+                content={subEntry.thinkingHistoryContent}
+                label={t("historyContent_thinking")}
+              />
+            {/if}
+          </div>
+        {:else if subEntry.kind === "user"}
+          <div class="text-sm text-foreground/80 py-1">
+            <MarkdownContent text={subEntry.content} />
+            {#if subEntry.historyContent && runId && historyGenerationId}
+              <HistoryContentPager
+                {runId}
+                generationId={historyGenerationId}
+                content={subEntry.historyContent}
+              />
+            {/if}
           </div>
         {:else if subEntry.kind === "tool"}
           <svelte:self
             tool={subEntry.tool}
             subTimeline={subEntry.subTimeline}
             {runId}
-            {fetchToolResult}
             {onAnswer}
             {onApprove}
             {onPermissionRespond}
             {taskNotifications}
             {showPermissionInPanel}
+            {codexAgentInfo}
             {agentDisplayName}
             {onPreviewFile}
+            {historyGenerationId}
           />
         {/if}
       {/each}

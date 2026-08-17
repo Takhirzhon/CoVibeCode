@@ -65,6 +65,8 @@ pub struct CodexSkillRef {
 pub enum PendingKind {
     /// Command / file / permission approval → `respond_permission`.
     Permission,
+    /// Claude hook callback approval. Codex does not currently emit this request kind.
+    Hook,
     /// MCP elicitation → `respond_elicitation`.
     Elicitation,
     /// Multiple-choice `request_user_input` → `respond_user_input`.
@@ -95,8 +97,9 @@ pub struct ParsedLine {
     /// BusEvents to persist + emit (message deltas, tool start/end, usage, and any
     /// interactive prompt events).
     pub events: Vec<BusEvent>,
-    /// Set when this line is a server→client interactive request awaiting a user response.
-    pub interactive: Option<PendingInteractive>,
+    /// Server→client interactive requests awaiting user responses. A parent notification can
+    /// register a child thread and replay more than one request that arrived before registration.
+    pub interactive: Vec<PendingInteractive>,
     /// Set when this line marks a turn boundary.
     pub lifecycle: Option<LifecycleSignal>,
     /// Set when this line carries the (resume) conversation id to persist.
@@ -106,6 +109,11 @@ pub struct ParsedLine {
     /// where `request_id` is the frontend control request id and `value` is the JSON-RPC
     /// `result` (or `error`). The actor routes it to the matching `control_waiter`.
     pub control_response: Option<(String, Value)>,
+    /// Wire frames the transport wants written back to the child immediately, without a user
+    /// in the loop — e.g. a JSON-RPC error reply to an unknown server-request, or
+    /// an autonomous `thread/read`. The actor flushes these to stdin after parse_line. The
+    /// Claude transport never sets this.
+    pub outbound: Vec<Value>,
 }
 
 /// Localizes all wire-format differences between agent transports. The actor calls these at
@@ -141,12 +149,16 @@ pub trait SessionProtocol: Send {
     /// Parse one stdout line into events + lifecycle/interactive/thread-id signals.
     fn parse_line(&mut self, run_id: &str, line: &str) -> ParsedLine;
 
-    /// Frame the user's response to a pending interactive request (Codex: a JSON-RPC
-    /// response on the stored request id). Empty = nothing to send (e.g. unknown id).
+    /// Frame the user's response to a pending interactive request. Unknown or mismatched
+    /// request ids are errors, never empty success.
     fn frame_response(
         &mut self,
         kind: PendingKind,
         request_id: &str,
         response: Value,
-    ) -> Vec<Value>;
+    ) -> Result<Vec<Value>, String>;
+
+    /// Validate an interactive response without consuming its pending request. The actor calls
+    /// this before persisting durable intent so a persistence failure remains safely retryable.
+    fn validate_response(&self, kind: PendingKind, request_id: &str) -> Result<(), String>;
 }

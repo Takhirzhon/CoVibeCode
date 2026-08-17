@@ -63,9 +63,20 @@
   import { TeamStore } from "$lib/stores/team-store.svelte";
   import { KeybindingStore } from "$lib/stores/keybindings.svelte";
   import { getTransport } from "$lib/transport";
-  // Build-time app version — fallback for the sidebar rail when the Tauri runtime
-  // getVersion() isn't available (web/remote mode). Bumped by the release script.
-  import { version as pkgVersion } from "../../package.json";
+  import { version as packageVersion } from "../../package.json";
+  import {
+    THEME_CONTEXT,
+    applyThemeClasses,
+    getSystemThemeQuery,
+    nextThemeMode,
+    persistColorScheme,
+    persistThemeMode,
+    readStoredColorScheme,
+    readStoredTheme,
+    type ColorScheme,
+    type ThemeController,
+    type ThemeMode,
+  } from "$lib/utils/theme";
   import {
     t,
     LOCALE_REGISTRY,
@@ -89,29 +100,26 @@
   let showSetupWizard = $state(false);
   let showAbout = $state(false);
   let showCliBrowser = $state(false);
-  // cwd the CLI session browser is scoped to: "/" = show all (toolbar button),
-  // or a specific folder when opened from the per-folder discovery banner.
-  let cliBrowserCwd = $state("/");
   let permissionsModalOpen = $state(false);
+  let appVersion = $state(packageVersion);
 
-  // Per-folder CLI session discovery (#folder-cli-discovery): when the active
-  // folder has Claude CLI sessions on disk that aren't imported yet, surface a
-  // banner so the user can review/import them. Counts refer to `discoveredCwd`.
-  let discoveredCwd = $state("");
-  let discoveredUnimported = $state(0);
+  async function loadAppVersion() {
+    if (!getTransport().isDesktop()) {
+      dbg("layout", "app version loaded", { source: "package", version: appVersion });
+      return;
+    }
 
-  // Sidebar rail version. getVersion() is the installed app version (matches the About
-  // dialog — issue #178: the rail was hardcoded to "v0.1"); fall back to the build-time
-  // package version for non-Tauri (web/remote) mode.
-  let appVersion = $state(pkgVersion);
-  onMount(async () => {
     try {
       const { getVersion } = await import("@tauri-apps/api/app");
       appVersion = await getVersion();
-    } catch {
-      // Non-Tauri context — keep the build-time fallback.
+      dbg("layout", "app version loaded", { source: "tauri", version: appVersion });
+    } catch (error) {
+      dbgWarn("layout", "failed to load Tauri app version", {
+        error,
+        fallbackVersion: packageVersion,
+      });
     }
-  });
+  }
 
   // Team store (shared via context with /teams page)
   const teamStore = new TeamStore();
@@ -129,30 +137,45 @@
   let settings = $state<UserSettings | null>(null);
   let sidebarOpen = $state(true);
   let projectCwd = $state("");
-  type ThemeMode = "light" | "dark" | "system";
-  type ColorScheme = "warm" | "neutral";
+
+  function getThemeStorage(): Storage | null {
+    try {
+      return window.localStorage;
+    } catch {
+      return null;
+    }
+  }
 
   function getInitialTheme(): ThemeMode {
     if (typeof window === "undefined") return "dark";
-    const saved = localStorage.getItem("ocv:theme");
-    if (saved === "light" || saved === "dark" || saved === "system") return saved;
-    return "dark";
+    const stored = readStoredTheme(getThemeStorage());
+    if (!stored.storageAvailable) dbgWarn("layout", "theme storage read failed");
+    return stored.mode;
   }
 
   function getInitialScheme(): ColorScheme {
     if (typeof window === "undefined") return "warm";
-    const saved = localStorage.getItem("ocv:colorScheme");
-    return saved === "neutral" ? "neutral" : "warm";
+    const stored = readStoredColorScheme(getThemeStorage());
+    if (!stored.storageAvailable) dbgWarn("layout", "color scheme storage read failed");
+    return stored.scheme;
   }
 
   let themeMode = $state<ThemeMode>(getInitialTheme());
   let colorScheme = $state<ColorScheme>(getInitialScheme());
   let systemDark = $state(
-    typeof window !== "undefined"
-      ? window.matchMedia("(prefers-color-scheme: dark)").matches
-      : true,
+    getSystemThemeQuery(typeof window === "undefined" ? null : window)?.matches ?? true,
   );
   let effectiveDark = $derived(themeMode === "system" ? systemDark : themeMode === "dark");
+  const themeController: ThemeController = {
+    get mode() {
+      return themeMode;
+    },
+    setMode(mode) {
+      themeMode = mode;
+      dbg("layout", "theme selected", { mode });
+    },
+  };
+  setContext(THEME_CONTEXT, themeController);
   let pinnedCwds = $state<string[]>([]);
   let removedCwds = $state<string[]>([]);
 
@@ -621,6 +644,7 @@
     loadSettings();
     loadSidebarFavorites();
     loadAgentSettingsCache();
+    void loadAppVersion();
 
     // Load saved CWD and pinned folders from localStorage
     const saved = localStorage.getItem("ocv:project-cwd");
@@ -1125,48 +1149,6 @@
     goto(`/chat?folder=${encodeURIComponent(cwd)}`);
   }
 
-  // Open the CLI session browser, optionally scoped to a folder's cwd.
-  // "/" keeps the original show-all behavior used by the toolbar button.
-  function openCliBrowser(cwd: string = "/") {
-    cliBrowserCwd = cwd || "/";
-    showCliBrowser = true;
-  }
-
-  // Count Claude CLI sessions on disk for `cwd` that aren't imported yet, so the
-  // sidebar can offer to surface them. Guards against races by stamping the
-  // result with the cwd it was requested for. Best-effort: errors leave the
-  // banner hidden rather than interrupting.
-  let discoverReqId = 0;
-  async function refreshFolderDiscovery(cwd: string) {
-    const target = normalizeCwd(cwd);
-    if (!target) {
-      discoveredCwd = "";
-      discoveredUnimported = 0;
-      return;
-    }
-    const reqId = ++discoverReqId;
-    try {
-      const result = await getTransport().invoke<{
-        sessions: { alreadyImported: boolean }[];
-      }>("discover_cli_sessions", { cwd: target, agent: "claude" });
-      if (reqId !== discoverReqId) return; // superseded by a newer folder
-      discoveredCwd = target;
-      discoveredUnimported = result.sessions.filter((s) => !s.alreadyImported).length;
-    } catch (e) {
-      if (reqId !== discoverReqId) return;
-      dbgWarn("layout", "folder CLI discovery failed", e);
-      discoveredCwd = target;
-      discoveredUnimported = 0;
-    }
-  }
-
-  // Re-discover whenever the active folder changes (chat page only).
-  $effect(() => {
-    const cwd = projectCwd;
-    if (!isChatPage) return;
-    refreshFolderDiscovery(cwd);
-  });
-
   function toggleProject(folderKey: string) {
     const next = new Set(expandedProjects);
     if (next.has(folderKey)) next.delete(folderKey);
@@ -1231,9 +1213,7 @@
   setContext("toggleSidebar", toggleSidebar);
 
   function cycleTheme() {
-    const order: ThemeMode[] = ["dark", "light", "system"];
-    const idx = order.indexOf(themeMode);
-    themeMode = order[(idx + 1) % order.length];
+    themeMode = nextThemeMode(themeMode);
     dbg("layout", "theme cycled", { themeMode, effectiveDark });
   }
 
@@ -1244,14 +1224,20 @@
 
   // Persist theme + apply class
   $effect(() => {
-    localStorage.setItem("ocv:theme", themeMode);
-    document.documentElement.classList.toggle("dark", effectiveDark);
+    applyThemeClasses(document.documentElement, themeMode, systemDark);
+    if (!persistThemeMode(getThemeStorage(), themeMode)) {
+      // Theme selection stays usable for this view even if persistence is unavailable.
+      dbgWarn("layout", "theme storage write failed");
+    }
   });
 
   // Persist color scheme + apply class
   $effect(() => {
-    localStorage.setItem("ocv:colorScheme", colorScheme);
     document.documentElement.classList.toggle("scheme-neutral", colorScheme === "neutral");
+    if (!persistColorScheme(getThemeStorage(), colorScheme)) {
+      // Keep the selected scheme in memory when persistence is unavailable.
+      dbgWarn("layout", "color scheme storage write failed");
+    }
   });
 
   // Auto-expand folder containing selected run (chats tab only)
@@ -1308,13 +1294,18 @@
 
   // Listen for system preference changes
   onMount(() => {
-    const mq = window.matchMedia("(prefers-color-scheme: dark)");
+    const mq = getSystemThemeQuery(window);
+    if (!mq) {
+      dbgWarn("layout", "system theme query unavailable");
+      return;
+    }
     function onSystemChange(e: MediaQueryListEvent) {
       systemDark = e.matches;
+      dbg("layout", "system theme changed", { systemDark: e.matches, themeMode });
     }
     mq.addEventListener("change", onSystemChange);
     // Apply initial theme
-    document.documentElement.classList.toggle("dark", effectiveDark);
+    applyThemeClasses(document.documentElement, themeMode, systemDark);
     return () => mq.removeEventListener("change", onSystemChange);
   });
 
@@ -1548,11 +1539,20 @@
           <button
             class="flex h-9 w-9 items-center justify-center rounded-md text-sidebar-foreground hover:bg-sidebar-accent/50 transition-colors duration-150"
             onclick={cycleTheme}
+            aria-label={themeMode === "dark"
+              ? t("layout_themeTitle_dark")
+              : themeMode === "light"
+                ? t("layout_themeTitle_light")
+                : themeMode === "high-contrast"
+                  ? t("layout_themeTitle_highContrast")
+                  : t("layout_themeTitle_system")}
             title={themeMode === "dark"
               ? t("layout_themeTitle_dark")
               : themeMode === "light"
                 ? t("layout_themeTitle_light")
-                : t("layout_themeTitle_system")}
+                : themeMode === "high-contrast"
+                  ? t("layout_themeTitle_highContrast")
+                  : t("layout_themeTitle_system")}
           >
             {#if themeMode === "dark"}
               <!-- Moon icon (dark mode active) -->
@@ -1573,6 +1573,19 @@
                 stroke-width="2"
                 ><circle cx="12" cy="12" r="4" /><path
                   d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"
+                /></svg
+              >
+            {:else if themeMode === "high-contrast"}
+              <!-- Split circle icon (high-contrast mode active) -->
+              <svg
+                class="h-[18px] w-[18px]"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                ><circle cx="12" cy="12" r="9" /><path
+                  d="M12 3a9 9 0 0 1 0 18Z"
+                  fill="currentColor"
                 /></svg
               >
             {:else}
@@ -1640,7 +1653,7 @@
           >
           <button
             class="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-sidebar-foreground hover:bg-sidebar-accent/50 transition-colors duration-150"
-            onclick={() => openCliBrowser("/")}
+            onclick={() => (showCliBrowser = true)}
             title={t("cliSync_title")}
           >
             <svg
@@ -2280,35 +2293,6 @@
             {:else}
               <!-- Project folder tree -->
               <div class="flex-1 overflow-y-auto px-2 py-1">
-                <!-- Un-imported on-disk CLI sessions for the active folder (#folder-cli-discovery) -->
-                {#if discoveredUnimported > 0 && discoveredCwd === normalizeCwd(projectCwd)}
-                  <button
-                    class="mb-1 flex w-full items-center gap-2 rounded-md border border-primary/30 bg-primary/10 px-2 py-1.5 text-left text-xs text-sidebar-foreground hover:bg-primary/20 transition-colors"
-                    onclick={() => openCliBrowser(projectCwd)}
-                    title={t("cliSync_discoverFolderHint")}
-                  >
-                    <svg
-                      class="h-3.5 w-3.5 shrink-0 text-primary"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      stroke-width="2"
-                      stroke-linecap="round"
-                      stroke-linejoin="round"
-                      ><polyline points="22 12 16 12 14 15 10 15 8 12 2 12" /><path
-                        d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"
-                      /></svg
-                    >
-                    <span class="flex-1 min-w-0 truncate"
-                      >{t("cliSync_discoverFolderBanner", {
-                        count: String(discoveredUnimported),
-                      })}</span
-                    >
-                    <span class="shrink-0 font-medium text-primary"
-                      >{t("cliSync_discoverFolderAction")}</span
-                    >
-                  </button>
-                {/if}
                 {#each projectFolders as folder (folder.folderKey)}
                   <ProjectFolderItem
                     {folder}
@@ -2548,12 +2532,11 @@
 
 {#if showCliBrowser}
   <CliSessionBrowser
-    cwd={cliBrowserCwd}
+    cwd="/"
     onclose={() => (showCliBrowser = false)}
     onimported={(runId) => {
       showCliBrowser = false;
       loadRuns();
-      refreshFolderDiscovery(projectCwd);
       goto(`/chat?run=${runId}`);
     }}
   />

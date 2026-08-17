@@ -17,10 +17,11 @@ const DB_NAME = "opencovibe-snapshot";
 const DB_VERSION = 1;
 const STORE_NAME = "snapshots";
 
-/** Bump when reducer logic changes to invalidate all cached snapshots.
- *  v3: user_message uuid-dedup — old snapshots may hold re-emitted "You" turns
- *  piled at the end; invalidating forces a clean replay that dedups them. */
-const SNAPSHOT_VERSION = 3;
+/** Bump when reducer/restore logic changes to invalidate all cached snapshots.
+ *  v3: user_message uuid-dedup (old snapshots piled re-emitted "You" turns at the end).
+ *  v4: merged upstream paged-history change (full timeline snapshots no longer restored) —
+ *      invalidate any pre-merge v3 snapshot so the combined reducer replays cleanly. */
+const SNAPSHOT_VERSION = 4;
 
 interface SnapshotRecord {
   runId: string; // primary key
