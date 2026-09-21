@@ -599,6 +599,42 @@ pub(crate) async fn start_session_impl(
         SessionMode::New => None,
     };
 
+    // 3b. Claude Code deletes transcripts that were inactive for `cleanupPeriodDays`
+    // (default 30) — `--resume <id>` then dies with "No conversation found with session ID"
+    // and the chat is stuck at "failed". The conversation itself lives in our own
+    // events.jsonl, so start a fresh CLI session in the same folder instead and tell the
+    // user the model no longer remembers the earlier turns.
+    let (session_mode, resume_session_id) = match (&session_mode, resume_session_id) {
+        (SessionMode::Resume | SessionMode::Continue, Some(sid))
+            if remote.is_none()
+                && meta.agent == "claude"
+                && !meta.no_session_persistence
+                && storage::cli_sessions::find_cli_session_path(&sid, &meta.cwd).is_err() =>
+        {
+            log::warn!(
+                "[session] transcript for session {} not found under ~/.claude/projects \
+                 (deleted by Claude Code's cleanupPeriodDays?) — starting a NEW session for run {}",
+                sid,
+                run_id
+            );
+            let notice = BusEvent::Raw {
+                run_id: run_id.clone(),
+                source: "app_notice".to_string(),
+                data: serde_json::Value::String(format!(
+                    "**Claude Code no longer has this conversation's transcript** \
+                     (session `{}`). The CLI deletes transcripts after `cleanupPeriodDays` of \
+                     inactivity (30 by default; set it higher in `~/.claude/settings.json`). \
+                     Continuing in a fresh Claude session in the same folder — the messages \
+                     above stay visible here, but Claude won't remember them.",
+                    sid
+                )),
+            };
+            emitter.persist_and_emit(&run_id, &notice);
+            (SessionMode::New, None)
+        }
+        (mode, sid) => (mode.clone(), sid),
+    };
+
     // Validate
     adapter::validate_session_params(&adapter_settings, &session_mode)?;
 

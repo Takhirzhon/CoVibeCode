@@ -4397,13 +4397,20 @@ export class SessionStore {
 
       case "raw": {
         const rawText = typeof ev.data === "string" ? ev.data : JSON.stringify(ev.data);
-        if (rawText && (ev.source === "claude_stdout_text" || ev.source === "claude_stderr")) {
+        if (
+          rawText &&
+          (ev.source === "claude_stdout_text" ||
+            ev.source === "claude_stderr" ||
+            ev.source === "app_notice")
+        ) {
           const rawId = uuid();
           const entry: TimelineEntry = {
             kind: "assistant",
             id: rawId,
             anchorId: rawId,
-            content: `\`[${ev.source}]\` ${rawText}`,
+            // app_notice: a message from CoVibeCode itself (e.g. "transcript gone, starting a
+            // fresh session") — render as-is, no `[source]` prefix.
+            content: ev.source === "app_notice" ? rawText : `\`[${ev.source}]\` ${rawText}`,
             ts: new Date().toISOString(),
           };
           this._pushTimeline(ctx, entry);

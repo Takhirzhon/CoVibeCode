@@ -1338,7 +1338,9 @@ pub fn import_session(
     })
 }
 
-fn find_cli_session_path(session_id: &str, cwd: &str) -> Result<PathBuf, String> {
+/// Locate a Claude CLI transcript (`~/.claude/projects/<encoded-cwd>/<session_id>.jsonl`),
+/// falling back to a scan of every project dir (the cwd encoding is lossy on Windows).
+pub fn find_cli_session_path(session_id: &str, cwd: &str) -> Result<PathBuf, String> {
     let projects_dir = claude_projects_dir().ok_or("cannot determine home dir")?;
     let filename = format!("{}.jsonl", session_id);
 
