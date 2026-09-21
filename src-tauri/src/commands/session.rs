@@ -673,6 +673,38 @@ pub(crate) async fn start_session_impl(
         );
     }
 
+    // 5b. Newer CLIs drop a project's saved `permissions.allow` rules until the folder is
+    // trusted ("Ignoring N permissions.allow entries … this workspace has not been trusted"),
+    // and our non-interactive spawn can never show the trust dialog — so every "always
+    // allow" the user saved kept prompting. The user chose this folder in the app; accept
+    // trust for them when the folder actually carries project settings.
+    if remote.is_none()
+        && meta.agent == "claude"
+        && storage::project_trust::has_project_settings(&meta.cwd)
+    {
+        match storage::project_trust::ensure_project_trusted(&meta.cwd) {
+            Ok(true) => {
+                let notice = BusEvent::Raw {
+                    run_id: run_id.clone(),
+                    source: "app_notice".to_string(),
+                    data: serde_json::Value::String(format!(
+                        "Marked `{}` as a trusted workspace for Claude Code so the permission \
+                         rules saved in its `.claude/settings*.json` apply (the CLI ignores them \
+                         in untrusted folders, and it can't show its trust dialog from here).",
+                        meta.cwd
+                    )),
+                };
+                emitter.persist_and_emit(&run_id, &notice);
+            }
+            Ok(false) => {}
+            Err(e) => log::warn!(
+                "[session] could not mark {} as trusted for Claude Code: {}",
+                meta.cwd,
+                e
+            ),
+        }
+    }
+
     // 6. Spawn CLI process (no initial stdin write — actor handles it).
     // Codex on the session_actor path uses the bidirectional `codex app-server` transport;
     // everything else (Claude, and Codex would-be-pipe_exec) uses the stream-json child.
