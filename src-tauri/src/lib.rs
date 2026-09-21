@@ -653,11 +653,21 @@ async fn graceful_shutdown_actors(app: &tauri::AppHandle) {
                 Vec::new()
             }
         };
-        for (run_id, mut child) in to_kill {
-            log::debug!("[app] graceful shutdown: killing stream process {}", run_id);
-            let _ = child.kill().await;
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await;
-        }
+        // Grace before kill (all in parallel) so quitting can't strand a half-persisted
+        // OAuth token refresh — see process_ext::reap_gracefully.
+        let stops = to_kill.into_iter().map(|(run_id, mut child)| async move {
+            log::debug!(
+                "[app] graceful shutdown: stopping stream process {}",
+                run_id
+            );
+            crate::process_ext::reap_gracefully(
+                &mut child,
+                std::time::Duration::from_secs(3),
+                &format!("stream process {}", run_id),
+            )
+            .await;
+        });
+        futures_util::future::join_all(stops).await;
     }
 
     log::debug!("[app] graceful shutdown complete");

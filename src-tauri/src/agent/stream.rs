@@ -605,9 +605,15 @@ pub async fn stop_process(process_map: &ProcessMap, run_id: &str) -> bool {
         map.remove(run_id)
     };
     if let Some(mut child) = removed {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-        log::debug!("[stream] stop_process: killed run_id={}", run_id);
+        // Grace before kill so a stop can't strand a half-persisted OAuth token refresh
+        // (see process_ext::reap_gracefully).
+        crate::process_ext::reap_gracefully(
+            &mut child,
+            std::time::Duration::from_secs(3),
+            &format!("stream process {}", run_id),
+        )
+        .await;
+        log::debug!("[stream] stop_process: stopped run_id={}", run_id);
         true
     } else {
         log::debug!("[stream] stop_process: no process for run_id={}", run_id);

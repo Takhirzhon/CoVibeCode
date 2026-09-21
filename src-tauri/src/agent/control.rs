@@ -2,10 +2,10 @@ use crate::agent::claude_stream::{
     augmented_path, claude_cred_gate, log_cred_state, resolve_claude_path,
 };
 use crate::models::{now_iso, CliAccount, CliCommand, CliInfo, CliInfoError, CliModelInfo};
-use crate::process_ext::HideConsole;
+use crate::process_ext::{reap_gracefully, HideConsole};
 use serde_json::Value;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::RwLock;
 use tokio::time::{timeout, Duration};
 
@@ -31,6 +31,10 @@ impl CliInfoCache {
 
 const CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long to let the probe process exit on its own after we have (or gave up on) its
+/// response before hard-killing it. Generous because this is where an expired OAuth token
+/// gets refreshed on a cold start, possibly over a network that is still waking up.
+const EXIT_GRACE: Duration = Duration::from_secs(20);
 
 /// Get CLI info, using cache if available and not expired.
 pub async fn get_cli_info(cache: &CliInfoCache, force: bool) -> Result<CliInfo, CliInfoError> {
@@ -129,11 +133,21 @@ pub async fn get_cli_info(cache: &CliInfoCache, force: bool) -> Result<CliInfo, 
         message: "Failed to capture stdout".to_string(),
     })?;
 
-    let result = timeout(PROCESS_TIMEOUT, read_control_response(stdout)).await;
+    // The reader lives OUTSIDE the timeout so the pipe stays open (and gets drained) while
+    // the process winds down — a closed stdout would make the CLI die on EPIPE, which is
+    // just another way of killing it mid-refresh.
+    let mut reader = BufReader::new(stdout).lines();
+    let result = timeout(PROCESS_TIMEOUT, read_control_response(&mut reader)).await;
 
-    // Kill process regardless
-    let _ = child.kill().await;
-    let _ = child.wait().await;
+    // Do NOT hard-kill the probe right after its control_response. When the OAuth access
+    // token has expired, the CLI refreshes it during startup and persists the ROTATED tokens
+    // only after answering the initialize request (measured on CLI 2.1.278: response at
+    // ~0.9s, credentials written at ~1.3s, exit at ~1.9s). Killing in that window is what
+    // used to log the user out on every cold start past the token expiry — see
+    // process_ext::reap_gracefully. stdin is already closed, so it exits by itself.
+    let drain = tokio::spawn(async move { while let Ok(Some(_)) = reader.next_line().await {} });
+    reap_gracefully(&mut child, EXIT_GRACE, "cli-info probe").await;
+    drain.abort();
 
     log_cred_state("cli_info:after");
     drop(cred_guard);
@@ -175,11 +189,8 @@ pub async fn get_cli_info(cache: &CliInfoCache, force: bool) -> Result<CliInfo, 
 
 /// Read stdout lines looking for a control_response event.
 async fn read_control_response(
-    stdout: tokio::process::ChildStdout,
+    reader: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
 ) -> Result<CliInfo, CliInfoError> {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-
-    let mut reader = BufReader::new(stdout).lines();
     let mut line_count = 0u32;
 
     while let Ok(Some(text)) = reader.next_line().await {

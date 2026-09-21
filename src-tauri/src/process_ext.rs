@@ -66,6 +66,43 @@ mod imp {
 #[allow(unused_imports)]
 pub use imp::*;
 
+// ── Graceful child reaping ──────────────────────────────────────────────────
+
+/// Give a `claude` child up to `grace` to exit on its own before hard-killing it.
+///
+/// Why not just `kill()`: when the OAuth access token has expired, the CLI refreshes it
+/// and persists the ROTATED tokens to `~/.claude/.credentials.json` asynchronously — on
+/// CLI 2.1.278 the file is written ~0.4s AFTER the process first responds. Killing inside
+/// that window leaves the file holding a refresh token the server has already rotated
+/// away, so every later `claude` process fails with "OAuth session expired and could not
+/// be refreshed" and the user is forced to log in again. Callers should close stdin first
+/// (EOF makes the CLI wind down by itself, typically within ~1s); this waits for that,
+/// then kills and reaps if the process overstays the grace period.
+pub async fn reap_gracefully(
+    child: &mut tokio::process::Child,
+    grace: std::time::Duration,
+    what: &str,
+) {
+    match tokio::time::timeout(grace, child.wait()).await {
+        Ok(Ok(status)) => {
+            log::debug!("[process] {} exited on its own: {:?}", what, status.code());
+        }
+        Ok(Err(e)) => {
+            log::warn!("[process] {} wait failed ({}), killing", what, e);
+            let _ = child.kill().await;
+        }
+        Err(_) => {
+            log::warn!(
+                "[process] {} still running after {:?} grace, killing",
+                what,
+                grace
+            );
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+    }
+}
+
 // ── Windows Job Object: kill children on process exit ───────────────────────
 
 /// Set up a Windows Job Object so that all child processes are automatically

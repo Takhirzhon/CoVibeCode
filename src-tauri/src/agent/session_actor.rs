@@ -35,6 +35,9 @@ use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+/// How long a stopped session gets to exit on its own after stdin EOF before being killed.
+const STOP_GRACE: Duration = Duration::from_secs(3);
+
 /// Strip ANSI/CSI escape sequences (e.g. `\x1b[31m`) so colored CLI stderr renders cleanly.
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -1869,10 +1872,13 @@ impl SessionActor {
         // Drop stdin to signal EOF to CLI
         self.stdin.take();
 
-        // Kill process
+        // Let the CLI wind down on EOF before killing: a stop that lands while it is
+        // persisting a refreshed OAuth token would otherwise strand a rotated-away refresh
+        // token in ~/.claude/.credentials.json (forced re-login). A turn that keeps running
+        // past the grace period is killed as before.
+        let what = format!("session {}", self.run_id);
         if let Some(ref mut child) = self.child {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            crate::process_ext::reap_gracefully(child, STOP_GRACE, &what).await;
         }
 
         Ok(())
