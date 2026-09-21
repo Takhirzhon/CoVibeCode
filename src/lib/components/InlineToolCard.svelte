@@ -1668,21 +1668,27 @@
               {t("perm_requestReason", { reason: tool.permission_reason })}
             </p>
           {/if}
-          {#if permissionDetails.length > 0}
-            <ul class="mb-2 space-y-1 text-xs text-muted-foreground">
-              {#each permissionDetails as permissionDetail}
-                <li class="whitespace-pre-wrap break-all">• {permissionDetail}</li>
-              {/each}
-            </ul>
-          {:else if detail}
-            <p
-              class="text-xs text-muted-foreground mb-2 whitespace-pre-wrap break-all"
-              style:direction={isPathLikeDetail ? "rtl" : undefined}
-              style:text-align={isPathLikeDetail ? "left" : undefined}
-            >
-              {#if isPathLikeDetail}<bdi>{detail}</bdi>{:else}{detail}{/if}
-            </p>
-          {/if}
+          <!-- Capped + scrollable: a long Bash heredoc / script must never push the
+               Allow / Deny buttons below the window (they were only reachable via Tab). -->
+          <div
+            class="mb-2 max-h-[40vh] overflow-y-auto rounded-md border border-amber-500/15 bg-background/40 px-2 py-1.5"
+          >
+            {#if permissionDetails.length > 0}
+              <ul class="space-y-1 text-xs text-muted-foreground">
+                {#each permissionDetails as permissionDetail}
+                  <li class="whitespace-pre-wrap break-all">• {permissionDetail}</li>
+                {/each}
+              </ul>
+            {:else if detail}
+              <p
+                class="text-xs text-muted-foreground whitespace-pre-wrap break-all"
+                style:direction={isPathLikeDetail ? "rtl" : undefined}
+                style:text-align={isPathLikeDetail ? "left" : undefined}
+              >
+                {#if isPathLikeDetail}<bdi>{detail}</bdi>{:else}{detail}{/if}
+              </p>
+            {/if}
+          </div>
           {#if onPermissionRespond}
             <div class="flex gap-2">
               <button
