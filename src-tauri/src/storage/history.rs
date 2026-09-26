@@ -33,6 +33,12 @@ const MAX_OPEN_TOOLS: usize = 256;
 const MAX_SUBHISTORIES: usize = 1024;
 const MAX_PENDING_INTERACTIONS: usize = 64;
 const MAX_JSON_NESTING_DEPTH: usize = 512;
+/// Appends past a published generation are replayed by the frontend catch-up, page by page
+/// with a render in between (measured: ~15k appended events ≈ 43 s of "the chat scrolls from
+/// the first message to the last"). An idle chat that kept working after its last build
+/// otherwise re-plays that tail on EVERY open. Past this much appended data a rebuild is the
+/// cheaper path, so the generation is treated as stale instead of handed to catch-up.
+const CATCHUP_REBUILD_BYTES: u64 = 512 * 1024;
 const MAX_JSON_SCALAR_BYTES: usize = 64 * 1024;
 
 static BUILD_LOCKS: Lazy<Vec<Mutex<()>>> = Lazy::new(|| (0..64).map(|_| Mutex::new(())).collect());
@@ -3267,8 +3273,12 @@ fn manifest_matches_source(source: &Path, manifest: &HistoryManifest, allow_appe
     if meta.len() < manifest.source_size || (!allow_append && meta.len() != manifest.source_size) {
         return false;
     }
-    // Appends after publication are consumed by bounded catch-up from `source_size`; rebuilding
-    // here would defeat that handoff and retain a new immutable generation on every run load.
+    // A small append is consumed by bounded catch-up from `source_size` (rebuilding for every
+    // append would retain a new immutable generation on every run load). A large one is not:
+    // see CATCHUP_REBUILD_BYTES.
+    if meta.len().saturating_sub(manifest.source_size) > CATCHUP_REBUILD_BYTES {
+        return false;
+    }
     // For an unchanged-length source, mtime still detects same-size replacement even when the
     // boundary windows happen to match.
     if meta.len() == manifest.source_size && modified_ns(&meta) != manifest.source_mtime_ns {
@@ -3672,6 +3682,41 @@ mod tests {
         let mut replacement = fs::read(&source).unwrap();
         replacement[1] = b'X';
         fs::write(&source, replacement).unwrap();
+        assert!(!manifest_matches_source(&source, &manifest, true));
+    }
+
+    #[test]
+    fn manifest_rejects_large_append_so_it_is_rebuilt_instead_of_replayed() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("events.jsonl");
+        fs::write(&source, b"{\"seq\":1}\n").unwrap();
+        let metadata = source.metadata().unwrap();
+        let source_size = metadata.len();
+        let manifest = HistoryManifest {
+            format_version: FORMAT_VERSION,
+            builder_version: BUILDER_VERSION,
+            generation_id: "0123456789abcdef0123456789abcdef".to_string(),
+            source_size,
+            source_mtime_ns: modified_ns(&metadata),
+            source_prefix_hash: hash_prefix(&source, source_size).unwrap(),
+            last_seq: 1,
+            page_count: 0,
+            total_entries: 0,
+            total_turns: 0,
+            complete: true,
+        };
+        let mut file = fs::OpenOptions::new().append(true).open(&source).unwrap();
+        // Just under the threshold: still a catch-up.
+        let line = b"{\"seq\":2,\"pad\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}\n";
+        let mut appended = 0u64;
+        while appended + line.len() as u64 <= CATCHUP_REBUILD_BYTES {
+            file.write_all(line).unwrap();
+            appended += line.len() as u64;
+        }
+        assert!(manifest_matches_source(&source, &manifest, true));
+        // Over it: stale, rebuild.
+        file.write_all(line).unwrap();
+        file.write_all(line).unwrap();
         assert!(!manifest_matches_source(&source, &manifest, true));
     }
 

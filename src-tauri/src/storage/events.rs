@@ -161,7 +161,10 @@ pub fn list_events(run_id: &str, since_seq: u64) -> Vec<RunEvent> {
 
 use std::sync::{Arc, Mutex};
 
-const BUS_EVENT_PAGE_ENTRY_LIMIT: usize = 100;
+/// Events per catch-up page. Each page is one IPC round trip plus a frontend render, so this
+/// directly sets how long a chat takes to open after its last history build (100 was ~0.1–0.3 s
+/// per page). The 1 MiB byte limit below still bounds the payload.
+const BUS_EVENT_PAGE_ENTRY_LIMIT: usize = 400;
 const BUS_EVENT_PAGE_BYTE_LIMIT: usize = 1024 * 1024;
 const BUS_EVENT_LINE_LIMIT: usize = 2 * 1024 * 1024;
 pub const HISTORY_PROJECTION_REQUIRED: &str = "HISTORY_PROJECTION_REQUIRED";
