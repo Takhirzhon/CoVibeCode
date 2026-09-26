@@ -25,7 +25,12 @@ const PARSE_LINE_LIMIT: usize = 2 * 1024 * 1024;
 const PREVIEW_HEAD_BYTES: usize = 24 * 1024;
 const PREVIEW_TAIL_BYTES: usize = 8 * 1024;
 const MAX_OPEN_TOOLS: usize = 256;
-const MAX_SUBHISTORIES: usize = 64;
+/// Sub-agent histories (one per `parent_tool_use_id`) kept open for the whole build — there is
+/// no eviction, so this bounds memory (each holds an unflushed page of ≤ PAGE_BYTE_LIMIT plus
+/// spool handles). 64 was too low: ordinary long chats reach 70+ Task sub-agents, and hitting
+/// the cap used to FAIL the whole build ("history subhistory limit exceeded: 64"), blanking the
+/// chat. Now generous, and overflow degrades to dropping the extra sub-agents' detail instead.
+const MAX_SUBHISTORIES: usize = 1024;
 const MAX_PENDING_INTERACTIONS: usize = 64;
 const MAX_JSON_NESTING_DEPTH: usize = 512;
 const MAX_JSON_SCALAR_BYTES: usize = 64 * 1024;
@@ -569,6 +574,8 @@ struct BuildState {
     seen_tool_ids: HashSet<String>,
     open_tools: HashMap<String, OpenTool>,
     subhistories: HashMap<String, SubHistoryState>,
+    /// Parents whose sub-history was skipped because MAX_SUBHISTORIES was reached (warned once each).
+    dropped_subhistories: HashSet<String>,
 }
 
 fn history_root(run_id: &str) -> PathBuf {
@@ -1772,6 +1779,7 @@ impl BuildState {
             seen_tool_ids: HashSet::new(),
             open_tools: HashMap::new(),
             subhistories: HashMap::new(),
+            dropped_subhistories: HashSet::new(),
         })
     }
 
@@ -2707,10 +2715,20 @@ impl BuildState {
         if !self.subhistories.contains_key(parent_tool_use_id)
             && self.subhistories.len() >= MAX_SUBHISTORIES
         {
-            return Err(format!(
-                "history subhistory limit exceeded: {}",
-                MAX_SUBHISTORIES
-            ));
+            // Never fail the build over this: the main timeline (including the parent Task
+            // card) still renders; only this sub-agent's expandable detail is lost.
+            if self
+                .dropped_subhistories
+                .insert(parent_tool_use_id.to_string())
+            {
+                log::warn!(
+                    "[history] subhistory limit {} reached: run_id={}, dropping sub-agent detail for parent_tool_use_id={}",
+                    MAX_SUBHISTORIES,
+                    self.run_id,
+                    parent_tool_use_id
+                );
+            }
+            return Ok(());
         }
         let child_history_id = sanitize_id(parent_tool_use_id);
         // Nested sub-agent events name their immediate child tool as the parent. Link that tool to
@@ -5123,6 +5141,33 @@ mod tests {
             "dead.build",
             Some(current)
         ));
+    }
+
+    #[test]
+    fn overflowing_subhistories_are_dropped_not_fatal() {
+        let temp = TempDir::new().unwrap();
+        let mut state = state(&temp);
+        let mut seq = 0u64;
+        for i in 0..(MAX_SUBHISTORIES + 5) {
+            let parent = format!("parent-{i}");
+            for event in [
+                json!({"type":"tool_start","run_id":"run-test","tool_use_id":parent,"tool_name":"Task","input":{"prompt":"work"}}),
+                json!({"type":"message_complete","run_id":"run-test","parent_tool_use_id":parent,"message_id":format!("m-{i}"),"text":"child answer"}),
+                json!({"type":"tool_end","run_id":"run-test","tool_use_id":parent,"tool_name":"Task","status":"success","output":{"result":"done"}}),
+            ] {
+                seq += 1;
+                state
+                    .handle_event(&json!({"_bus":true,"seq":seq,"ts":"t","event":event}))
+                    .unwrap();
+            }
+        }
+        assert_eq!(state.subhistories.len(), MAX_SUBHISTORIES);
+        assert_eq!(state.dropped_subhistories.len(), 5);
+        // Every parent Task card is still in the main timeline (flushed pages + open page).
+        let flushed: usize = (1..=state.page_count)
+            .map(|n| page_entries(&state.pages_dir, n).len())
+            .sum();
+        assert_eq!(flushed + state.page.len(), MAX_SUBHISTORIES + 5);
     }
 
     #[test]
